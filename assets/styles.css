@@ -1,0 +1,435 @@
+/* PDF Q&A Extractor - Custom Styles */
+
+/* ========================================
+   Main Container
+   ======================================== */
+.main {
+    padding: 2rem;
+}
+
+.block-container {
+    max-width: 1200px;
+    padding: 2rem 1rem;
+}
+
+/* ========================================
+   Custom Card Styling
+   ======================================== */
+.stExpander {
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    margin-bottom: 1rem;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    transition: all 0.3s ease;
+}
+
+.stExpander:hover {
+    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+    border-color: #4CAF50;
+}
+
+/* ========================================
+   File Uploader Styling
+   ======================================== */
+.uploadedFile {
+    border: 2px dashed #4CAF50;
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+}
+
+[data-testid="stFileUploader"] {
+    padding: 2rem;
+    background-color: #f8f9fa;
+    border-radius: 10px;
+    border: 2px dashed #ccc;
+}
+
+[data-testid="stFileUploader"]:hover {
+    border-color: #4CAF50;
+    background-color: #f0f8f0;
+}
+
+/* ========================================
+   Button Styling
+   ======================================== */
+.stButton>button {
+    width: 100%;
+    border-radius: 8px;
+    height: 3rem;
+    font-weight: 600;
+    transition: all 0.3s ease;
+    border: none;
+}
+
+.stButton>button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+}
+
+.stButton>button[kind="primary"] {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.stButton>button[kind="secondary"] {
+    background-color: #f0f0f0;
+    color: #333;
+}
+
+/* ========================================
+   Data Table Styling
+   ======================================== */
+.dataframe {
+    font-size: 14px;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+[data-testid="stDataFrame"] {
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+/* ========================================
+   Sidebar Styling
+   ======================================== */
+[data-testid="stSidebar"] {
+    background-color: #f8f9fa;
+    border-right: 2px solid #e0e0e0;
+}
+
+[data-testid="stSidebar"] .stMarkdown {
+    padding: 0.5rem 0;
+}
+
+/* ========================================
+   Message Styling
+   ======================================== */
+.stSuccess {
+    border-radius: 8px;
+    padding: 1rem;
+    animation: slideIn 0.5s ease;
+    background-color: #d4edda;
+    border-left: 4px solid #28a745;
+}
+
+.stError {
+    border-radius: 8px;
+    padding: 1rem;
+    animation: shake 0.5s ease;
+    background-color: #f8d7da;
+    border-left: 4px solid #dc3545;
+}
+
+.stWarning {
+    border-radius: 8px;
+    padding: 1rem;
+    background-color: #fff3cd;
+    border-left: 4px solid #ffc107;
+}
+
+.stInfo {
+    border-radius: 8px;
+    padding: 1rem;
+    background-color: #e3f2fd;
+    border-left: 4px solid #2196F3;
+}
+
+/* ========================================
+   Animations
+   ======================================== */
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-5px); }
+    75% { transform: translateX(5px); }
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
+}
+
+/* ========================================
+   Loading Spinner
+   ======================================== */
+.stSpinner > div {
+    border-color: #4CAF50 !important;
+}
+
+[data-testid="stSpinner"] {
+    animation: fadeIn 0.3s ease;
+}
+
+/* ========================================
+   Divider
+   ======================================== */
+hr {
+    margin: 2rem 0;
+    border: none;
+    border-top: 2px solid #e0e0e0;
+}
+
+/* ========================================
+   Metrics Cards
+   ======================================== */
+[data-testid="stMetricValue"] {
+    font-size: 2rem;
+    font-weight: 700;
+}
+
+[data-testid="stMetricLabel"] {
+    font-size: 0.9rem;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.metric-card {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    padding: 1.5rem;
+    border-radius: 10px;
+    color: white;
+    text-align: center;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+}
+
+/* ========================================
+   Confidence Badges
+   ======================================== */
+.confidence-high {
+    background-color: #4CAF50;
+    color: white;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-block;
+}
+
+.confidence-medium {
+    background-color: #FF9800;
+    color: white;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-block;
+}
+
+.confidence-low {
+    background-color: #f44336;
+    color: white;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-block;
+}
+
+/* ========================================
+   Custom Input Styling
+   ======================================== */
+.stTextInput>div>div>input {
+    border-radius: 8px;
+    border: 2px solid #e0e0e0;
+    padding: 0.75rem;
+    transition: all 0.3s ease;
+}
+
+.stTextInput>div>div>input:focus {
+    border-color: #4CAF50;
+    box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.1);
+}
+
+/* ========================================
+   Slider Styling
+   ======================================== */
+.stSlider>div>div>div>div {
+    background-color: #4CAF50;
+}
+
+/* ========================================
+   Radio Button Styling
+   ======================================== */
+[data-testid="stRadio"] > label {
+    display: flex;
+    gap: 1rem;
+}
+
+/* ========================================
+   Progress Bar
+   ======================================== */
+.stProgress > div > div > div > div {
+    background-color: #4CAF50;
+}
+
+/* ========================================
+   Code Block Styling
+   ======================================== */
+.stCodeBlock {
+    border-radius: 8px;
+    border: 1px solid #e0e0e0;
+}
+
+/* ========================================
+   Empty State
+   ======================================== */
+.empty-state {
+    text-align: center;
+    padding: 3rem;
+    background-color: #f8f9fa;
+    border-radius: 10px;
+    border: 2px dashed #ccc;
+    animation: fadeIn 0.5s ease;
+}
+
+.empty-state h3 {
+    color: #666;
+    margin-bottom: 1rem;
+}
+
+.empty-state p {
+    color: #999;
+}
+
+/* ========================================
+   Download Button Group
+   ======================================== */
+.download-button-group {
+    display: flex;
+    gap: 1rem;
+    margin: 1rem 0;
+}
+
+/* ========================================
+   Responsive Design
+   ======================================== */
+@media (max-width: 768px) {
+    .main {
+        padding: 1rem;
+    }
+    
+    .block-container {
+        padding: 1rem 0.5rem;
+    }
+    
+    .stButton>button {
+        height: 2.5rem;
+        font-size: 14px;
+    }
+    
+    [data-testid="stMetricValue"] {
+        font-size: 1.5rem;
+    }
+    
+    .metric-card {
+        padding: 1rem;
+    }
+}
+
+/* ========================================
+   Dark Mode Support (Optional)
+   ======================================== */
+@media (prefers-color-scheme: dark) {
+    .stExpander {
+        border-color: #444;
+    }
+    
+    [data-testid="stSidebar"] {
+        background-color: #1e1e1e;
+        border-right-color: #444;
+    }
+    
+    .empty-state {
+        background-color: #2a2a2a;
+        border-color: #444;
+    }
+}
+
+/* ========================================
+   Custom Scrollbar
+   ======================================== */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #555;
+}
+
+/* ========================================
+   Footer
+   ======================================== */
+.footer {
+    text-align: center;
+    color: #999;
+    padding: 2rem 0;
+    margin-top: 3rem;
+    border-top: 1px solid #e0e0e0;
+}
+
+.footer a {
+    color: #4CAF50;
+    text-decoration: none;
+    transition: color 0.3s ease;
+}
+
+.footer a:hover {
+    color: #45a049;
+    text-decoration: underline;
+}
+
+/* ========================================
+   Tooltip
+   ======================================== */
+.tooltip {
+    position: relative;
+    display: inline-block;
+}
+
+.tooltip .tooltiptext {
+    visibility: hidden;
+    background-color: #555;
+    color: #fff;
+    text-align: center;
+    border-radius: 6px;
+    padding: 5px 10px;
+    position: absolute;
+    z-index: 1;
+    bottom: 125%;
+    left: 50%;
+    margin-left: -60px;
+    opacity: 0;
+    transition: opacity 0.3s;
+}
+
+.tooltip:hover .tooltiptext {
+    visibility: visible;
+    opacity: 1;
+}

@@ -127,6 +127,3 @@ If you see errors like "model not found" or "permission denied":
 - processor.py writes the uploaded PDF to a temporary file and deletes it after the request.
 - Results are stored in Streamlit session state for the current session.
 
-## License
-
-Add a license if you plan to publish this repository.

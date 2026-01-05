@@ -4,7 +4,6 @@ Extract questions and answers from PDF documents using Google's Gemini 1.5 Flash
 """
 
 import streamlit as st
-import google.generativeai as genai
 from dotenv import load_dotenv
 import os
 import json
@@ -12,8 +11,11 @@ import pandas as pd
 from datetime import datetime
 import tempfile
 import time
+from typing import Any, Dict, Optional
 
-from processor import GeminiConfig, extract_qa_pairs_from_pdf_bytes
+import requests
+
+from processor import GeminiConfig, extract_create_quiz_dto_from_pdf_bytes
 
 # Load environment variables
 load_dotenv()
@@ -57,6 +59,21 @@ def initialize_session_state():
         'results': None,
         'uploaded_file_name': None,
         'processing_complete': False,
+
+        # Backend API settings
+        'backend_base_url': os.getenv('TAPCET_API_BASE_URL', 'https://localhost:7237'),
+        'backend_email': os.getenv('TAPCET_API_EMAIL', ''),
+        'backend_password': os.getenv('TAPCET_API_PASSWORD', ''),
+        'backend_verify_tls': os.getenv('TAPCET_API_VERIFY_TLS', 'true').strip().lower() not in {'0', 'false', 'no'},
+
+        # Backend auth cache
+        'backend_token': None,
+        'backend_token_expires_at': None,
+        'backend_user_email': None,
+        'backend_user_name': None,
+        'backend_auth_error': None,
+        'backend_last_login_attempt': 0.0,
+        'backend_auto_login': True,
         
         # API configuration
         'api_key_valid': False,
@@ -78,6 +95,114 @@ def initialize_session_state():
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def _normalize_base_url(url: str) -> str:
+    s = (url or '').strip()
+    while s.endswith('/'):
+        s = s[:-1]
+    return s
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    # Handle common Zulu suffix.
+    if s.endswith('Z'):
+        s = s[:-1] + '+00:00'
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _backend_token_is_valid() -> bool:
+    token = st.session_state.get('backend_token')
+    expires_at = st.session_state.get('backend_token_expires_at')
+    if not token or not isinstance(token, str):
+        return False
+    if not isinstance(expires_at, datetime):
+        return True
+    if expires_at.tzinfo is None:
+        return datetime.now() < expires_at
+    return datetime.now(expires_at.tzinfo) < expires_at
+
+
+def backend_login(*, timeout_s: int = 20) -> bool:
+    """Login to backend and cache JWT token in session state."""
+
+    base_url = _normalize_base_url(st.session_state.get('backend_base_url', ''))
+    email = (st.session_state.get('backend_email') or '').strip()
+    password = st.session_state.get('backend_password') or ''
+
+    st.session_state.backend_auth_error = None
+
+    if not base_url:
+        st.session_state.backend_auth_error = 'Missing backend base URL'
+        return False
+    if not email or not password:
+        st.session_state.backend_auth_error = 'Missing backend email/password'
+        return False
+
+    # Simple throttle to avoid hammering during reruns.
+    now_ts = time.time()
+    last_attempt = float(st.session_state.get('backend_last_login_attempt') or 0.0)
+    if now_ts - last_attempt < 3.0:
+        return False
+    st.session_state.backend_last_login_attempt = now_ts
+
+    url = f"{base_url}/api/auth/login"
+    try:
+        resp = requests.post(
+            url,
+            json={"email": email, "password": password},
+            timeout=timeout_s,
+            verify=bool(st.session_state.get('backend_verify_tls', True)),
+        )
+    except requests.RequestException as e:
+        st.session_state.backend_auth_error = f"Login request failed: {e}"
+        return False
+
+    if resp.status_code != 200:
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        msg = None
+        if isinstance(payload, dict):
+            msg = payload.get('message')
+        st.session_state.backend_auth_error = msg or f"Login failed (HTTP {resp.status_code})"
+        return False
+
+    try:
+        data = resp.json()
+    except ValueError:
+        st.session_state.backend_auth_error = 'Login response was not JSON'
+        return False
+
+    token = data.get('token')
+    if not isinstance(token, str) or not token.strip():
+        st.session_state.backend_auth_error = 'Login response missing token'
+        return False
+
+    st.session_state.backend_token = token.strip()
+    st.session_state.backend_token_expires_at = _parse_iso_datetime(data.get('expiresAt'))
+    st.session_state.backend_user_email = data.get('email') if isinstance(data.get('email'), str) else None
+    st.session_state.backend_user_name = data.get('userName') if isinstance(data.get('userName'), str) else None
+    st.session_state.backend_auth_error = None
+    return True
+
+
+def ensure_backend_token() -> bool:
+    """Ensure we have a valid backend token, optionally auto-login."""
+    if _backend_token_is_valid():
+        return True
+    if not st.session_state.get('backend_auto_login', True):
+        return False
+    return backend_login()
 
 
 def reset_session():
@@ -212,6 +337,69 @@ def render_sidebar():
         st.session_state.include_page_numbers = include_page_numbers
         st.session_state.include_confidence = include_confidence
         st.session_state.extract_metadata = extract_metadata
+
+        st.markdown("---")
+
+        # Backend Configuration
+        st.subheader("Backend API")
+
+        st.session_state.backend_base_url = st.text_input(
+            "Base URL",
+            value=st.session_state.backend_base_url,
+            help="Example: https://localhost:7237",
+        )
+
+        st.session_state.backend_verify_tls = st.checkbox(
+            "Verify TLS",
+            value=bool(st.session_state.get('backend_verify_tls', True)),
+            help="Disable only for local dev if Python cannot validate the HTTPS dev certificate.",
+        )
+
+        # Normalize after input
+        st.session_state.backend_base_url = _normalize_base_url(st.session_state.backend_base_url)
+        st.session_state.backend_email = st.text_input(
+            "Email",
+            value=st.session_state.backend_email,
+            placeholder="admin@tapcet.com",
+        )
+        st.session_state.backend_password = st.text_input(
+            "Password",
+            value=st.session_state.backend_password,
+            type="password",
+        )
+
+        st.session_state.backend_auto_login = st.checkbox(
+            "Auto-login",
+            value=bool(st.session_state.backend_auto_login),
+            help="Automatically log in and refresh token when needed",
+        )
+
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("Login", use_container_width=True, type="secondary"):
+                ok = backend_login()
+                if ok:
+                    st.success("Logged in")
+                else:
+                    st.error(st.session_state.get('backend_auth_error') or 'Login failed')
+        with colB:
+            if st.button("Logout", use_container_width=True, type="secondary"):
+                st.session_state.backend_token = None
+                st.session_state.backend_token_expires_at = None
+                st.session_state.backend_user_email = None
+                st.session_state.backend_user_name = None
+                st.session_state.backend_auth_error = None
+
+        # Attempt auto-login if enabled and creds exist
+        _ = ensure_backend_token()
+        if _backend_token_is_valid():
+            st.success("Backend authorized")
+        else:
+            err = st.session_state.get('backend_auth_error')
+            if err:
+                st.warning(err)
+            else:
+                st.info("Not authorized")
         
         st.markdown("---")
         
@@ -269,21 +457,15 @@ def render_header():
     """, unsafe_allow_html=True)
     
     # Quick stats if results exist
-    if st.session_state.results:
-        col1, col2, col3, col4 = st.columns(4)
-        
+    results = st.session_state.results
+    if isinstance(results, dict) and isinstance(results.get('questions'), list):
+        col1, col2, col3 = st.columns(3)
+
         with col1:
-            st.metric("Total Q&A", len(st.session_state.results))
-        
+            st.metric("Questions", len(results.get('questions') or []))
         with col2:
-            high_conf = sum(1 for r in st.session_state.results if r.get('confidence') == 'high')
-            st.metric("High Confidence", high_conf)
-        
+            st.metric("Title", results.get('title') or 'N/A')
         with col3:
-            pages = set(r.get('page_number', 'N/A') for r in st.session_state.results)
-            st.metric("Pages Covered", len(pages))
-        
-        with col4:
             st.metric("File", st.session_state.uploaded_file_name or "N/A")
     
     st.divider()
@@ -313,10 +495,10 @@ def process_document(uploaded_file):
                 max_output_tokens=st.session_state.max_tokens,
             )
 
-            status_text.text("Step 3/4: Extracting Q&A with Gemini...")
+            status_text.text("Step 3/4: Extracting MCQs with Gemini...")
             progress_bar.progress(65)
 
-            results = extract_qa_pairs_from_pdf_bytes(
+            results = extract_create_quiz_dto_from_pdf_bytes(
                 pdf_bytes=pdf_bytes,
                 filename=uploaded_file.name,
                 cfg=cfg,
@@ -328,7 +510,8 @@ def process_document(uploaded_file):
             st.session_state.results = results
             st.session_state.processing_complete = True
             progress_bar.progress(100)
-            st.success(f"Successfully extracted {len(results)} Q&A pairs.")
+            q_count = len(results.get('questions') or []) if isinstance(results, dict) else 0
+            st.success(f"Successfully extracted {q_count} questions.")
 
         except Exception as e:
             st.session_state.processing_complete = False
@@ -395,9 +578,9 @@ def render_upload_section():
         with col2:
             if not st.session_state.api_key_valid:
                 st.error("Please enter a valid API key in the sidebar")
-                st.button("Extract Q&A Pairs", disabled=True, use_container_width=True, type="primary")
+                st.button("Extract Quiz", disabled=True, use_container_width=True, type="primary")
             else:
-                if st.button("Extract Q&A Pairs", use_container_width=True, type="primary"):
+                if st.button("Extract Quiz", use_container_width=True, type="primary"):
                     process_document(uploaded_file)
         
         return uploaded_file
@@ -433,127 +616,126 @@ def render_footer():
 
 
 def render_results_section():
-    """Render extracted Q&A results"""
+    """Render extracted quiz results (CreateQuizDto)."""
 
     results = st.session_state.get('results')
-    if not results:
+    if not isinstance(results, dict) or not isinstance(results.get('questions'), list):
         return
 
     st.markdown("---")
     st.subheader("Extraction Results")
 
-    total_qa = len(results)
-    high_conf = sum(1 for r in results if r.get('confidence') == 'high')
-    unique_pages = len(set(r.get('page_number', 'N/A') for r in results))
+    st.write(f"Title: {results.get('title') or 'N/A'}")
+    if results.get('description'):
+        st.write(f"Description: {results.get('description')}")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Q&A", total_qa)
-    with col2:
-        st.metric("High Confidence", high_conf)
-    with col3:
-        st.metric("Unique Pages", unique_pages)
+    questions = results.get('questions') or []
+    st.metric("Questions", len(questions))
 
-    st.markdown("")
+    search_query = st.text_input(
+        "Search",
+        placeholder="Search in questions",
+        label_visibility="collapsed",
+    )
 
-    col1, col2 = st.columns([3, 2])
-    with col1:
-        view_mode = st.radio(
-            "View Mode",
-            options=["Table", "Cards", "JSON"],
-            horizontal=True,
-            label_visibility="collapsed",
-        )
-    with col2:
-        search_query = st.text_input(
-            "Search",
-            placeholder="Search in questions and answers",
-            label_visibility="collapsed",
-        )
-
-    filtered = results
+    filtered = questions
     if search_query:
         q = search_query.strip().lower()
         if q:
-            filtered = [
-                r for r in results
-                if q in str(r.get('question', '')).lower() or q in str(r.get('answer', '')).lower()
-            ]
+            filtered = [qq for qq in questions if q in str(qq.get('text', '')).lower()]
             st.info(f"Matches: {len(filtered)}")
 
-    if view_mode == "Table":
-        df = pd.DataFrame(filtered)
+    for idx, q in enumerate(filtered, start=1):
+        q_text = str(q.get('text', '')).strip()
+        header = f"Q{idx}: {q_text[:90]}" if q_text else f"Q{idx}"
+        with st.expander(header, expanded=(idx == 1)):
+            st.markdown("**Question**")
+            st.write(q_text)
 
-        column_order = ['question_number', 'question', 'answer']
-        if st.session_state.get('include_page_numbers', True):
-            column_order.append('page_number')
-        if st.session_state.get('include_confidence', True):
-            column_order.append('confidence')
+            expl = q.get('explanation')
+            if expl:
+                st.markdown("**Explanation**")
+                st.write(expl)
 
-        df = df[[c for c in column_order if c in df.columns]]
-        rename_map = {
-            'question_number': 'Question #',
-            'page_number': 'Page',
-            'confidence': 'Confidence',
-            'question': 'Question',
-            'answer': 'Answer',
-        }
-        df = df.rename(columns=rename_map)
+            st.markdown("**Choices**")
+            for choice in (q.get('choices') or []):
+                c_text = str(choice.get('text', '')).strip()
+                suffix = " (correct)" if choice.get('isCorrect') else ""
+                st.write(f"- {c_text}{suffix}")
 
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                'Question #': st.column_config.NumberColumn('Question #', width='small'),
-                'Page': st.column_config.NumberColumn('Page', width='small'),
-            },
-        )
+    st.markdown("---")
+    st.subheader("Backend")
 
-    elif view_mode == "Cards":
-        if not filtered:
-            st.info("No results to display.")
-            return
-
-        for idx, item in enumerate(filtered, start=1):
-            qn = item.get('question_number', idx)
-            question = str(item.get('question', '')).strip()
-            answer = str(item.get('answer', '')).strip()
-            page_number = item.get('page_number', 'N/A')
-            confidence = item.get('confidence', 'N/A')
-
-            header = f"Q{qn}: {question[:90]}" if question else f"Q{qn}"
-            with st.expander(header, expanded=(idx == 1)):
-                if question:
-                    st.markdown("**Question**")
-                    st.write(question)
-                if answer:
-                    st.markdown("**Answer**")
-                    st.write(answer)
-
-                meta_parts = []
-                if st.session_state.get('include_page_numbers', True):
-                    meta_parts.append(f"Page: {page_number}")
-                if st.session_state.get('include_confidence', True):
-                    meta_parts.append(f"Confidence: {confidence}")
-                if meta_parts:
-                    st.caption(" | ".join(meta_parts))
-
+    if _backend_token_is_valid():
+        st.success("Ready to create quiz in backend")
     else:
-        st.code(json.dumps(filtered, indent=2), language='json')
+        st.info("Login in the sidebar to create quiz")
+
+    if st.button("Create Quiz in Backend", type="primary", use_container_width=True):
+        if not ensure_backend_token():
+            st.error(st.session_state.get('backend_auth_error') or 'Not authorized')
+        else:
+            base_url = _normalize_base_url(st.session_state.get('backend_base_url', ''))
+            url = f"{base_url}/api/quiz"
+            token = st.session_state.get('backend_token')
+            try:
+                resp = requests.post(
+                    url,
+                    json=results,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=30,
+                    verify=False,
+                )
+            except requests.RequestException as e:
+                st.error(f"Request failed: {e}")
+                return
+
+            if resp.status_code == 201:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                st.success("Quiz created")
+                if payload is not None:
+                    st.session_state.created_quiz_response = payload
+                    st.json(payload)
+            elif resp.status_code == 401:
+                st.session_state.backend_token = None
+                st.error("Unauthorized (token expired or invalid)")
+            else:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = resp.text
+                st.error(f"Create quiz failed (HTTP {resp.status_code})")
+                st.write(payload)
 
 
 def render_export_section():
-    """Render export buttons for extracted data"""
+    """Render export buttons for extracted quiz data"""
 
     results = st.session_state.get('results')
-    if not results:
+    if not isinstance(results, dict) or not isinstance(results.get('questions'), list):
         return
 
     st.markdown("---")
     st.subheader("Export")
 
-    df = pd.DataFrame(results)
+    # Flatten questions for CSV
+    rows = []
+    for idx, q in enumerate(results.get('questions') or [], start=1):
+        choices = q.get('choices') or []
+        correct_text = next((c.get('text') for c in choices if c.get('isCorrect')), None)
+        rows.append(
+            {
+                "question_number": idx,
+                "question": q.get('text'),
+                "correct_choice": correct_text,
+                "choices": "; ".join([str(c.get('text', '')).strip() for c in choices]),
+            }
+        )
+
+    df = pd.DataFrame(rows)
     csv_data = df.to_csv(index=False).encode('utf-8')
     json_data = json.dumps(results, indent=2)
 
@@ -563,7 +745,7 @@ def render_export_section():
         st.download_button(
             label="Download CSV",
             data=csv_data,
-            file_name=f"qa_pairs_{ts}.csv",
+            file_name=f"quiz_{ts}.csv",
             mime="text/csv",
             use_container_width=True,
             type="secondary",
@@ -572,7 +754,7 @@ def render_export_section():
         st.download_button(
             label="Download JSON",
             data=json_data,
-            file_name=f"qa_pairs_{ts}.json",
+            file_name=f"quiz_{ts}.json",
             mime="application/json",
             use_container_width=True,
             type="secondary",

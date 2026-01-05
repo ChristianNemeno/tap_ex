@@ -12,6 +12,8 @@ from datetime import datetime
 import tempfile
 import time
 from typing import Any, Dict, Optional
+import logging
+import traceback
 
 import requests
 
@@ -19,6 +21,54 @@ from processor import GeminiConfig, extract_create_quiz_dto_from_pdf_bytes
 
 # Load environment variables
 load_dotenv()
+
+
+def _get_logger() -> logging.Logger:
+    logger = logging.getLogger("tap_ex")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    log_path = os.path.join(os.getcwd(), "tap_ex.log")
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
+    # Also emit to console (shows up in Streamlit logs)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    logger.addHandler(stream_handler)
+
+    return logger
+
+
+LOGGER = _get_logger()
+
+
+def _safe_key_fingerprint(key: str) -> str:
+    if not isinstance(key, str) or not key:
+        return "<empty>"
+    tail = key[-4:] if len(key) >= 4 else key
+    return f"len={len(key)} tail=***{tail}"
+
+
+def _looks_like_auth_error(message: str) -> bool:
+    m = (message or "").lower()
+    return any(
+        s in m
+        for s in [
+            "api key",
+            "invalid api key",
+            "invalid key",
+            "unauthorized",
+            "permission denied",
+            "forbidden",
+            "401",
+            "403",
+        ]
+    )
 
 # Page Configuration - MUST be the first Streamlit command
 st.set_page_config(
@@ -57,6 +107,9 @@ def initialize_session_state():
     defaults = {
         # Results storage
         'results': None,
+        'quiz_json_editor': None,
+        'quiz_json_validated': None,
+        'quiz_json_validation_errors': None,
         'uploaded_file_name': None,
         'processing_complete': False,
 
@@ -117,6 +170,137 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         return datetime.fromisoformat(s)
     except ValueError:
         return None
+
+
+def _clamp_text(value: Any, *, min_len: int, max_len: int) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if len(s) > max_len:
+        s = s[:max_len].rstrip()
+    if len(s) < min_len:
+        return None
+    return s
+
+
+def _normalize_choices(choices: Any, errors: list[str], *, q_index: int) -> Optional[list[dict]]:
+    if not isinstance(choices, list):
+        errors.append(f"Question {q_index}: choices must be a list")
+        return None
+
+    items: list[dict] = []
+    for c in choices:
+        if not isinstance(c, dict):
+            continue
+        text = _clamp_text(c.get('text'), min_len=1, max_len=500)
+        if not text:
+            continue
+        items.append({'text': text, 'isCorrect': bool(c.get('isCorrect'))})
+
+    if len(items) < 2:
+        errors.append(f"Question {q_index}: must have at least 2 choices")
+        return None
+    if len(items) > 6:
+        # Trim extra choices to satisfy backend rule
+        items = items[:6]
+
+    correct_indexes = [i for i, c in enumerate(items) if c.get('isCorrect') is True]
+    if len(correct_indexes) == 1:
+        return items
+    if len(correct_indexes) == 0:
+        # Default: mark first option correct (user can fix in editor)
+        items[0]['isCorrect'] = True
+        errors.append(f"Question {q_index}: no correct choice marked; defaulted first choice to correct")
+        return items
+
+    keep = correct_indexes[0]
+    for i in correct_indexes[1:]:
+        items[i]['isCorrect'] = False
+    items[keep]['isCorrect'] = True
+    errors.append(f"Question {q_index}: multiple correct choices; kept first as correct")
+    return items
+
+
+def validate_and_normalize_create_quiz_dto(payload: Any) -> tuple[Optional[dict], list[str]]:
+    """Validate+normalize a CreateQuizDto-like dict before POSTing to the backend.
+
+    Returns (normalized_payload, errors). If normalized_payload is None, it's not safe to POST.
+    """
+
+    errors: list[str] = []
+    if not isinstance(payload, dict):
+        return None, ["Payload must be a JSON object"]
+
+    title = _clamp_text(payload.get('title'), min_len=3, max_len=200)
+    if not title:
+        errors.append("title is required (3-200 chars)")
+
+    description_raw = payload.get('description', None)
+    description: Optional[str]
+    if description_raw is None:
+        description = None
+    else:
+        description = _clamp_text(description_raw, min_len=0, max_len=2000)
+
+    questions_raw = payload.get('questions')
+    if not isinstance(questions_raw, list) or len(questions_raw) < 1:
+        errors.append("questions is required (at least 1 question)")
+        questions_raw = []
+
+    normalized_questions: list[dict] = []
+    for i, q in enumerate(questions_raw, start=1):
+        if not isinstance(q, dict):
+            errors.append(f"Question {i}: must be an object")
+            continue
+
+        q_text = _clamp_text(q.get('text'), min_len=5, max_len=100)
+        if not q_text:
+            errors.append(f"Question {i}: text is required (5-100 chars)")
+            continue
+
+        explanation_raw = q.get('explanation', None)
+        explanation: Optional[str]
+        if explanation_raw is None:
+            explanation = None
+        else:
+            explanation = _clamp_text(explanation_raw, min_len=0, max_len=300)
+
+        image_url = q.get('imageUrl', None)
+        if isinstance(image_url, str):
+            image_url = image_url.strip()
+            if not (image_url.startswith('http://') or image_url.startswith('https://')):
+                errors.append(f"Question {i}: imageUrl must be a valid URL")
+                image_url = None
+        else:
+            image_url = None
+
+        choices = _normalize_choices(q.get('choices'), errors, q_index=i)
+        if choices is None:
+            continue
+
+        out_q = {
+            'text': q_text,
+            'explanation': explanation,
+            'imageUrl': image_url,
+            'choices': choices,
+        }
+        # drop None fields
+        out_q = {k: v for k, v in out_q.items() if v is not None}
+        normalized_questions.append(out_q)
+
+    if not normalized_questions:
+        errors.append("No valid questions found")
+
+    if errors and (not title or not normalized_questions):
+        return None, errors
+
+    normalized = {
+        'title': title,
+        'description': description,
+        'questions': normalized_questions,
+    }
+    normalized = {k: v for k, v in normalized.items() if v is not None}
+    return normalized, errors
 
 
 def _backend_token_is_valid() -> bool:
@@ -508,6 +692,10 @@ def process_document(uploaded_file):
             progress_bar.progress(95)
 
             st.session_state.results = results
+            # Seed JSON editor with extracted payload
+            st.session_state.quiz_json_editor = json.dumps(results, indent=2)
+            st.session_state.quiz_json_validated = None
+            st.session_state.quiz_json_validation_errors = None
             st.session_state.processing_complete = True
             progress_bar.progress(100)
             q_count = len(results.get('questions') or []) if isinstance(results, dict) else 0
@@ -516,8 +704,30 @@ def process_document(uploaded_file):
         except Exception as e:
             st.session_state.processing_complete = False
             st.session_state.results = None
-            st.error(f"An error occurred: {str(e)}")
-            st.info("Check your API key and try again.")
+            st.session_state.quiz_json_validated = None
+            st.session_state.quiz_json_validation_errors = None
+
+            err_text = str(e) or e.__class__.__name__
+            LOGGER.error(
+                "Gemini extraction failed | file=%s | model=%s | temp=%.1f | max_tokens=%s | api_key=%s",
+                getattr(uploaded_file, 'name', 'unknown'),
+                getattr(cfg, 'model_name', 'unknown') if 'cfg' in locals() else 'unknown',
+                float(st.session_state.get('temperature', 0.0) or 0.0),
+                st.session_state.get('max_tokens'),
+                _safe_key_fingerprint(st.session_state.get('api_key', '')),
+            )
+            LOGGER.error("Exception: %s", err_text)
+            LOGGER.error(traceback.format_exc())
+
+            # If it looks like an auth error, invalidate the key so UI prompts clearly.
+            if _looks_like_auth_error(err_text):
+                st.session_state.api_key_valid = False
+                st.error("Gemini request failed (API key/auth issue).")
+                st.info("Re-check GEMINI_API_KEY in .env or paste a valid key in the sidebar.")
+                st.caption("Details were written to tap_ex.log")
+            else:
+                st.error(f"An error occurred: {err_text}")
+                st.info("Details were written to tap_ex.log")
 
         finally:
             progress_bar.empty()
@@ -664,6 +874,64 @@ def render_results_section():
                 st.write(f"- {c_text}{suffix}")
 
     st.markdown("---")
+    st.subheader("Edit & Validate JSON")
+
+    if st.session_state.get('quiz_json_editor') is None:
+        st.session_state.quiz_json_editor = json.dumps(results, indent=2)
+
+    st.caption("Edit the CreateQuizDto JSON. Validate before creating the quiz.")
+    edited_text = st.text_area(
+        "CreateQuizDto JSON",
+        value=st.session_state.quiz_json_editor,
+        height=280,
+        key="quiz_json_editor",
+    )
+
+    colA, colB, colC = st.columns(3)
+    with colA:
+        if st.button("Validate JSON", type="secondary", use_container_width=True):
+            try:
+                obj = json.loads(edited_text or "")
+            except json.JSONDecodeError as e:
+                st.session_state.quiz_json_validated = None
+                st.session_state.quiz_json_validation_errors = [f"Invalid JSON: {e}"]
+            else:
+                normalized, errs = validate_and_normalize_create_quiz_dto(obj)
+                st.session_state.quiz_json_validated = normalized
+                st.session_state.quiz_json_validation_errors = errs
+                if normalized is not None:
+                    # Reformat the editor with normalized JSON for convenience
+                    st.session_state.quiz_json_editor = json.dumps(normalized, indent=2)
+
+    with colB:
+        if st.button("Reset to Extracted", type="secondary", use_container_width=True):
+            st.session_state.quiz_json_editor = json.dumps(results, indent=2)
+            st.session_state.quiz_json_validated = None
+            st.session_state.quiz_json_validation_errors = None
+
+    with colC:
+        st.download_button(
+            label="Download Edited JSON",
+            data=edited_text or "",
+            file_name=f"create_quiz_edited_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True,
+            type="secondary",
+        )
+
+    errs = st.session_state.get('quiz_json_validation_errors')
+    if errs:
+        # These are mostly warnings unless the payload is invalid (validated None)
+        if st.session_state.get('quiz_json_validated') is None:
+            st.error("Validation failed. Fix the issues below.")
+        else:
+            st.warning("Validated with warnings:")
+        for msg in errs:
+            st.write(f"- {msg}")
+    elif st.session_state.get('quiz_json_validated') is not None:
+        st.success("JSON validated and ready to send")
+
+    st.markdown("---")
     st.subheader("Backend")
 
     if _backend_token_is_valid():
@@ -675,16 +943,31 @@ def render_results_section():
         if not ensure_backend_token():
             st.error(st.session_state.get('backend_auth_error') or 'Not authorized')
         else:
+            # Always parse+validate the current editor content before sending.
+            current_text = st.session_state.get('quiz_json_editor') or ''
+            try:
+                obj = json.loads(current_text)
+            except json.JSONDecodeError as e:
+                st.error(f"Invalid JSON: {e}")
+                return
+
+            payload, errs = validate_and_normalize_create_quiz_dto(obj)
+            st.session_state.quiz_json_validated = payload
+            st.session_state.quiz_json_validation_errors = errs
+            if payload is None:
+                st.error("Fix JSON validation errors before creating the quiz.")
+                return
+
             base_url = _normalize_base_url(st.session_state.get('backend_base_url', ''))
             url = f"{base_url}/api/quiz"
             token = st.session_state.get('backend_token')
             try:
                 resp = requests.post(
                     url,
-                    json=results,
+                    json=payload,
                     headers={"Authorization": f"Bearer {token}"},
                     timeout=30,
-                    verify=False,
+                    verify=bool(st.session_state.get('backend_verify_tls', True)),
                 )
             except requests.RequestException as e:
                 st.error(f"Request failed: {e}")

@@ -57,6 +57,36 @@ Output strictly as JSON.
 """.strip()
 
 
+REPAIR_TO_JSON_PROMPT_TEMPLATE = """
+You returned output that was not valid JSON.
+
+Task:
+Convert the text below into ONE valid JSON object that matches this schema (CreateQuizDto):
+
+{
+    "title": "...",
+    "description": "...",
+    "questions": [
+        {
+            "text": "...",
+            "explanation": "...",
+            "imageUrl": "...",
+            "choices": [
+                { "text": "...", "isCorrect": true },
+                { "text": "...", "isCorrect": false }
+            ]
+        }
+    ]
+}
+
+Rules:
+- Output ONLY valid JSON. No markdown, no commentary.
+- Ensure: 2-6 choices per question and EXACTLY ONE correct choice.
+
+Text to convert:
+""".strip()
+
+
 @dataclass(frozen=True)
 class GeminiConfig:
     api_key: str
@@ -95,14 +125,19 @@ def extract_create_quiz_dto_from_pdf_bytes(
             tmp_path = tmp.name
 
         uploaded = genai.upload_file(path=tmp_path, display_name=filename)
+
+        # Attempt 1: direct extraction
         resp = model.generate_content([uploaded, MCQ_CREATE_QUIZ_PROMPT])
+        text = getattr(resp, "text", None) or str(resp)
 
-        text = getattr(resp, "text", None)
-        if not text:
-            # Some SDK versions provide candidates/parts; fall back to string.
-            text = str(resp)
-
-        return _parse_and_normalize_create_quiz_dto(text)
+        try:
+            return _parse_and_normalize_create_quiz_dto(text)
+        except ValueError:
+            # Attempt 2: ask the model to repair/convert to strict JSON
+            repair_prompt = f"{REPAIR_TO_JSON_PROMPT_TEMPLATE}\n\n{text}\n"
+            resp2 = model.generate_content([repair_prompt])
+            text2 = getattr(resp2, "text", None) or str(resp2)
+            return _parse_and_normalize_create_quiz_dto(text2)
 
     finally:
         if tmp_path:
@@ -283,4 +318,7 @@ def _safe_json_load(raw: str) -> Any:
         except json.JSONDecodeError:
             pass
 
-    raise ValueError("Failed to parse JSON from model response")
+    preview = re.sub(r"\s+", " ", s)
+    if len(preview) > 800:
+        preview = preview[:800] + "..."
+    raise ValueError(f"Failed to parse JSON from model response. Preview: {preview}")

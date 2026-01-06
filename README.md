@@ -1,28 +1,67 @@
 # PDF Q&A Extractor
 
-A Streamlit app that extracts question-and-answer pairs from a PDF using the Gemini API, then displays results and lets you export them as CSV or JSON.
+A modular Streamlit application that extracts multiple-choice questions from PDFs using Google's Gemini AI and integrates with a backend API for quiz creation.
 
 ## Features
 
-- Upload a PDF (text-based or scanned)
-- Extract Q&A pairs using Gemini
-- View results as a table, cards, or raw JSON
-- Search within extracted questions and answers
-- Export results to CSV and JSON
+-  **PDF Upload**: Support for text-based and scanned PDFs (up to 200 pages)
+-  **AI Extraction**: Extracts MCQs in backend-compatible CreateQuizDto format
+-  **JSON Editor**: Review and edit extracted quiz data before submission
+-  **Auto-Login**: Caches JWT tokens with automatic re-authentication
+-  **Validation**: Ensures 2-6 choices per question with exactly one correct answer
+-  **Progress Tracking**: Real-time progress for large PDF processing
+-  **Export**: Download results as JSON or CSV
+-  **Chunked Processing**: Splits large PDFs into 20-page chunks for optimal processing
+
+## Architecture
+
+The application follows a modular architecture with clear separation of concerns:
+
+```
+tap_ex/
+├── core/           # Business logic (validation, config, logging)
+├── backend/        # API integration (auth, quiz creation)
+├── extraction/     # AI & PDF processing (Gemini, PDF utils)
+├── ui/             # Streamlit components (sidebar, upload, results)
+└── app.py          # Main orchestrator (84 lines)
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed architecture documentation.
 
 ## Requirements
 
 - Windows PowerShell (recommended)
-- Python (installed via python.org or the Windows py launcher)
-- A Gemini API key
+- Python 3.8+ (installed via python.org or Windows py launcher)
+- Google Gemini API key
+- Backend API URL (optional, for quiz creation)
 
-## Project Files
+## Project Structure
 
-- app.py: Streamlit UI and controller logic
-- processor.py: Gemini API call and JSON parsing/normalization
-- assets/styles.css: Optional UI styling
-- .env: Local environment variables (not committed)
-- requirements.txt: Python dependencies
+### Core Modules
+- **core/config.py**: Session state management
+- **core/logging_utils.py**: Safe logging with API key fingerprinting
+- **core/validation.py**: CreateQuizDto validation
+
+### Backend Integration
+- **backend/auth.py**: JWT authentication and token management
+- **backend/quiz_api.py**: Quiz creation endpoint integration
+
+### Extraction Layer
+- **extraction/gemini.py**: Gemini AI integration for MCQ extraction
+- **extraction/pdf_utils.py**: PDF manipulation and splitting
+
+### UI Components
+- **ui/components.py**: Common UI elements (header, footer, CSS)
+- **ui/sidebar.py**: Configuration sidebar
+- **ui/upload.py**: File upload and processing
+- **ui/results.py**: Results display with JSON editor
+- **ui/export.py**: Export functionality
+
+### Documentation
+- [ARCHITECTURE.md](ARCHITECTURE.md): Architecture details and design patterns
+- [REFACTORING_SUMMARY.md](REFACTORING_SUMMARY.md): Refactoring summary
+- [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md): Migration instructions
+- [STRUCTURE.md](STRUCTURE.md): Project structure overview
 
 ## Setup
 
@@ -46,6 +85,7 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 ```powershell
 python -m pip install -r requirements.txt
+python -m pip install "cryptography>=3.1"  # For encrypted PDF support
 ```
 
 If you do not have requirements.txt installed yet, you can install directly:

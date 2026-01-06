@@ -133,20 +133,6 @@ Streamlit will print a local URL (typically http://localhost:8501). Open it in y
 
 The processor uses a default model name in processor.py. If you change the model name, your key/project must have access to that model, otherwise the request will fail.
 
-## Troubleshooting
-
-### Streamlit runs, but VS Code shows "Import streamlit could not be resolved"
-
-This usually means VS Code is not using your .venv interpreter.
-Fix:
-- In VS Code, select the Python interpreter located at:
-  C:\Nemeno\tap_ex\.venv\Scripts\python.exe
-
-### API key not detected
-
-- Confirm .env is in the project root: C:\Nemeno\tap_ex\.env
-- Confirm the variable name is exactly GEMINI_API_KEY
-- Restart Streamlit after changing .env
 
 ### Model response is not valid JSON
 
@@ -167,6 +153,3 @@ If you see errors like "model not found" or "permission denied":
 - processor.py writes the uploaded PDF to a temporary file and deletes it after the request.
 - Results are stored in Streamlit session state for the current session.
 
-## License
-
-Add a license if you plan to publish this repository.

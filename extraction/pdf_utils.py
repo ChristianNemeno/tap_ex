@@ -35,6 +35,31 @@ def split_pdf_into_chunks(pdf_bytes: bytes, *, pages_per_chunk: int = 20) -> Lis
     return chunks
 
 
+def split_pdf_into_single_pages(pdf_bytes: bytes) -> List[bytes]:
+    """Split a PDF into separate single-page PDFs.
+    
+    Args:
+        pdf_bytes: Original PDF bytes
+        
+    Returns:
+        List of PDF bytes, each containing exactly one page
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    total_pages = len(reader.pages)
+    
+    single_pages: List[bytes] = []
+    for page_idx in range(total_pages):
+        writer = PdfWriter()
+        writer.add_page(reader.pages[page_idx])
+        
+        page_buffer = io.BytesIO()
+        writer.write(page_buffer)
+        page_buffer.seek(0)
+        single_pages.append(page_buffer.read())
+    
+    return single_pages
+
+
 def get_page_count(pdf_bytes: bytes) -> int:
     """Get the total number of pages in a PDF.
     

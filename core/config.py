@@ -46,6 +46,7 @@ def get_session_state_defaults() -> Dict[str, Any]:
         'include_page_numbers': True,
         'include_confidence': True,
         'extract_metadata': False,
+        'extraction_mode': 'Chunked (Fast)',  # or 'Page-by-Page (Detailed)'
         
         # UI state
         'show_examples': False,

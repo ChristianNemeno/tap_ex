@@ -6,13 +6,22 @@ from datetime import datetime
 import streamlit as st
 from pypdf import PdfReader
 
-from extraction.gemini import GeminiConfig, extract_create_quiz_dto_from_pdf_bytes
+from extraction.gemini import GeminiConfig, extract_create_quiz_dto_from_pdf_bytes, extract_create_quiz_dto_by_page
 
 
 def render_upload_section():
     """Render the file upload section."""
     
     st.header("📄 Upload Document")
+    
+    # Extraction mode selection
+    extraction_mode = st.radio(
+        "Extraction Mode",
+        options=["Chunked (Fast)", "Page-by-Page (Detailed)"],
+        help="Chunked: Groups pages into 20-page chunks. Page-by-Page: Processes each page individually with rate limiting (slower but more precise)",
+        horizontal=True
+    )
+    st.session_state.extraction_mode = extraction_mode
     
     uploaded_file = st.file_uploader(
         "Choose a PDF file",
@@ -131,12 +140,21 @@ def process_document(uploaded_file):
                 bar_pct = int(40 + (pct * 55))
                 progress_bar.progress(bar_pct)
 
-            results = extract_create_quiz_dto_from_pdf_bytes(
-                pdf_bytes=pdf_bytes,
-                filename=uploaded_file.name,
-                cfg=cfg,
-                progress_callback=update_progress,
-            )
+            # Choose extraction method based on mode
+            if st.session_state.get('extraction_mode') == "Page-by-Page (Detailed)":
+                results = extract_create_quiz_dto_by_page(
+                    pdf_bytes=pdf_bytes,
+                    filename=uploaded_file.name,
+                    cfg=cfg,
+                    progress_callback=update_progress,
+                )
+            else:
+                results = extract_create_quiz_dto_from_pdf_bytes(
+                    pdf_bytes=pdf_bytes,
+                    filename=uploaded_file.name,
+                    cfg=cfg,
+                    progress_callback=update_progress,
+                )
 
             status_text.text("Step 5/5: Finalizing...")
             progress_bar.progress(95)

@@ -9,14 +9,15 @@ import json
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, Tuple
 import io
 
 import google.generativeai as genai
 from pypdf import PdfReader
 
-from extraction.pdf_utils import split_pdf_into_chunks, get_page_count
+from extraction.pdf_utils import split_pdf_into_chunks, split_pdf_into_single_pages, get_page_count
 
 
 DEFAULT_MODEL_NAME = "gemini-3-flash-preview"
@@ -56,7 +57,8 @@ Rules (must follow):
 - question.text: 5-100 chars.
 - question.explanation: optional, max 300 chars.
 - imageUrl: optional; include only if explicitly provided and is a valid URL.
-
+- There are times that there is no answer key sheet but the answer is highlighted or marked in the text. Use that to determine the correct answer.
+- If theres no answer key at all provide an answer based on the question context.
 Output strictly as JSON.
 """.strip()
 
@@ -172,6 +174,190 @@ def extract_create_quiz_dto_from_pdf_bytes(
     }
 
     return result
+
+
+def extract_create_quiz_dto_by_page(
+    *,
+    pdf_bytes: bytes,
+    filename: str,
+    cfg: GeminiConfig,
+    progress_callback: Optional[Callable[[str, float], None]] = None,
+) -> Dict[str, Any]:
+    """Extract questions page-by-page with rate limiting.
+    
+    Splits PDF into single-page PDFs, processes in batches of 10 (Gemini limit),
+    with 5 RPM rate limiting. Returns results grouped by page.
+    
+    Args:
+        pdf_bytes: Original PDF bytes
+        filename: PDF filename
+        cfg: Gemini configuration
+        progress_callback: Optional callback for progress updates
+        
+    Returns:
+        Dictionary with title, description, and pages array containing questions per page
+    """
+    if not cfg.api_key:
+        raise ValueError("Missing GEMINI_API_KEY")
+
+    # Validate page count
+    total_pages = get_page_count(pdf_bytes)
+    if total_pages > cfg.max_pages:
+        raise ValueError(f"PDF has {total_pages} pages (max allowed: {cfg.max_pages})")
+
+    if progress_callback:
+        progress_callback(f"Splitting {total_pages} pages...", 0.05)
+
+    # Split into single-page PDFs
+    single_page_pdfs = split_pdf_into_single_pages(pdf_bytes)
+    if not single_page_pdfs:
+        raise ValueError("Failed to split PDF into pages")
+
+    if progress_callback:
+        progress_callback(f"Created {len(single_page_pdfs)} single-page PDFs", 0.1)
+
+    genai.configure(api_key=cfg.api_key)
+    generation_config: Dict[str, Any] = {
+        "temperature": float(cfg.temperature),
+        "max_output_tokens": int(cfg.max_output_tokens),
+        "response_mime_type": "application/json",
+    }
+    model = genai.GenerativeModel(model_name=cfg.model_name, generation_config=generation_config)
+
+    # Process pages in batches of 10 (Gemini upload limit) with rate limiting (5 RPM)
+    batch_size = 10
+    rpm_limit = 5
+    seconds_per_request = 60.0 / rpm_limit  # 12 seconds between requests for 5 RPM
+    
+    num_batches = (len(single_page_pdfs) + batch_size - 1) // batch_size
+    pages_with_questions: List[Dict[str, Any]] = []
+    last_request_time = 0.0
+
+    for batch_idx in range(num_batches):
+        # Rate limiting: ensure we don't exceed 5 RPM
+        if batch_idx > 0:
+            elapsed = time.time() - last_request_time
+            if elapsed < seconds_per_request:
+                wait_time = seconds_per_request - elapsed
+                if progress_callback:
+                    progress_callback(
+                        f"Rate limiting: waiting {wait_time:.1f}s (5 RPM limit)...",
+                        0.1 + (0.8 * (batch_idx / num_batches)),
+                    )
+                time.sleep(wait_time)
+        
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(single_page_pdfs))
+        batch_pages = single_page_pdfs[batch_start:batch_end]
+
+        if progress_callback:
+            progress_callback(
+                f"Processing pages {batch_start + 1}-{batch_end}/{total_pages}...",
+                0.1 + (0.8 * (batch_idx / num_batches)),
+            )
+
+        last_request_time = time.time()
+        batch_results = _process_pages_batch(
+            batch_pages, 
+            model, 
+            filename, 
+            batch_start
+        )
+        pages_with_questions.extend(batch_results)
+
+    if progress_callback:
+        progress_callback(f"Completed processing {total_pages} pages", 0.95)
+
+    # Build final result with page-grouped questions
+    title = f"Quiz from {filename}"
+    if len(title) > 200:
+        title = title[:197] + "..."
+
+    result = {
+        "title": title,
+        "description": f"Extracted from {total_pages}-page PDF (page-by-page)",
+        "pages": pages_with_questions,  # Array of {pageNumber, questions[]}
+        "totalPages": total_pages,
+    }
+
+    return result
+
+
+def _process_pages_batch(
+    page_pdfs: List[bytes],
+    model: Any,
+    base_filename: str,
+    batch_offset: int,
+) -> List[Dict[str, Any]]:
+    """Process a batch of single-page PDFs and return questions with page numbers.
+    
+    Args:
+        page_pdfs: List of single-page PDF bytes
+        model: Gemini model instance
+        base_filename: Original filename
+        batch_offset: Starting page index for this batch
+        
+    Returns:
+        List of dicts with pageNumber and questions array
+    """
+    uploaded_files = []
+    tmp_paths: List[str] = []
+    results: List[Dict[str, Any]] = []
+
+    try:
+        # Upload all pages in this batch
+        for i, page_bytes in enumerate(page_pdfs):
+            page_num = batch_offset + i + 1  # 1-indexed page numbers
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(page_bytes)
+                tmp.flush()
+                tmp_paths.append(tmp.name)
+                uploaded = genai.upload_file(
+                    path=tmp.name, 
+                    display_name=f"{base_filename}_page{page_num}"
+                )
+                uploaded_files.append((uploaded, page_num))
+
+        # Process each page individually to maintain page-to-questions mapping
+        for uploaded_file, page_num in uploaded_files:
+            prompt_parts = [uploaded_file, MCQ_CREATE_QUIZ_PROMPT]
+            resp = model.generate_content(prompt_parts)
+            text = getattr(resp, "text", None) or str(resp)
+
+            try:
+                dto = _parse_and_normalize_create_quiz_dto(text)
+            except ValueError:
+                # Retry with repair prompt
+                repair_prompt = f"{REPAIR_TO_JSON_PROMPT_TEMPLATE}\n\n{text}\n"
+                resp2 = model.generate_content([repair_prompt])
+                text2 = getattr(resp2, "text", None) or str(resp2)
+                dto = _parse_and_normalize_create_quiz_dto(text2)
+
+            # Extract questions and associate with page number
+            questions = dto.get("questions", [])
+            if isinstance(questions, list) and questions:
+                results.append({
+                    "pageNumber": page_num,
+                    "questions": questions,
+                    "questionCount": len(questions),
+                })
+            else:
+                # No questions found on this page
+                results.append({
+                    "pageNumber": page_num,
+                    "questions": [],
+                    "questionCount": 0,
+                })
+
+    finally:
+        # Cleanup temp files
+        for tmp_path in tmp_paths:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    return results
 
 
 def _process_chunk_batch(

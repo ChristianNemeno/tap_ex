@@ -28,9 +28,11 @@ from extraction.gemini import (
     REPAIR_TO_JSON_PROMPT_TEMPLATE,
     GeminiConfig,
     extract_create_quiz_dto_from_pdf_bytes,
+    extract_create_quiz_dto_by_page,
 )
 from extraction.pdf_utils import (
     split_pdf_into_chunks,
+    split_pdf_into_single_pages,
     get_page_count,
 )
 
@@ -41,6 +43,8 @@ __all__ = [
     'REPAIR_TO_JSON_PROMPT_TEMPLATE',
     'GeminiConfig',
     'extract_create_quiz_dto_from_pdf_bytes',
+    'extract_create_quiz_dto_by_page',
     'split_pdf_into_chunks',
+    'split_pdf_into_single_pages',
     'get_page_count',
 ]

@@ -39,18 +39,33 @@ def render_filtered_pages_section():
     
     st.success(f"Found **{filtered_count}** pages with questions out of **{total_pages}** total pages")
     
-    # Summary info
-    col1, col2, col3 = st.columns([2, 2, 2])
+    # Summary info with better visibility
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.metric("Pages with Questions", filtered_count)
+        st.markdown(f"""
+        <div style='text-align: center; padding: 1rem; background-color: #f0f2f6; border-radius: 10px;'>
+            <h3 style='color: #0068c9; margin: 0;'>{filtered_count}</h3>
+            <p style='color: #262730; margin: 0;'>Pages with Questions</p>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col2:
-        st.metric("Total Pages", total_pages)
+        st.markdown(f"""
+        <div style='text-align: center; padding: 1rem; background-color: #f0f2f6; border-radius: 10px;'>
+            <h3 style='color: #0068c9; margin: 0;'>{total_pages}</h3>
+            <p style='color: #262730; margin: 0;'>Total Pages</p>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col3:
         reduction = int((1 - filtered_count / total_pages) * 100) if total_pages > 0 else 0
-        st.metric("AI Cost Reduction", f"{reduction}%")
+        st.markdown(f"""
+        <div style='text-align: center; padding: 1rem; background-color: #f0f2f6; border-radius: 10px;'>
+            <h3 style='color: #00c853; margin: 0;'>{reduction}%</h3>
+            <p style='color: #262730; margin: 0;'>AI Cost Reduction</p>
+        </div>
+        """, unsafe_allow_html=True)
     
     st.markdown("---")
     

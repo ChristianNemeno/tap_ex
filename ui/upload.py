@@ -6,7 +6,8 @@ from datetime import datetime
 import streamlit as st
 from pypdf import PdfReader
 
-from extraction.gemini import GeminiConfig, extract_create_quiz_dto_from_pdf_bytes, extract_create_quiz_dto_by_page
+from extraction.gemini import GeminiConfig, filter_pages_with_questions
+from extraction.pdf_utils import get_page_count
 
 
 def render_upload_section():
@@ -14,14 +15,16 @@ def render_upload_section():
     
     st.header("📄 Upload Document")
     
-    # Extraction mode selection
-    extraction_mode = st.radio(
-        "Extraction Mode",
-        options=["Chunked (Fast)", "Page-by-Page (Detailed)"],
-        help="Chunked: Groups pages into 20-page chunks. Page-by-Page: Processes each page individually with rate limiting (slower but more precise)",
-        horizontal=True
-    )
-    st.session_state.extraction_mode = extraction_mode
+    # Only show upload if not already filtered
+    if st.session_state.ocr_filtering_complete:
+        st.info(f"✅ OCR filtering complete. Review filtered pages below.")
+        if st.button("🔄 Upload Different PDF"):
+            st.session_state.ocr_filtering_complete = False
+            st.session_state.filtered_pages = []
+            st.session_state.filtered_page_numbers = []
+            st.session_state.total_pages = 0
+            st.rerun()
+        return None
     
     uploaded_file = st.file_uploader(
         "Choose a PDF file",
@@ -85,10 +88,10 @@ def render_upload_section():
         with col2:
             if not st.session_state.api_key_valid:
                 st.error("Please enter a valid API key in the sidebar")
-                st.button("Extract Quiz", disabled=True, use_container_width=True, type="primary")
+                st.button("Scan for Questions (OCR)", disabled=True, use_container_width=True, type="primary")
             else:
-                if st.button("Extract Quiz", use_container_width=True, type="primary"):
-                    process_document(uploaded_file)
+                if st.button("🔍 Scan for Questions (OCR)", use_container_width=True, type="primary"):
+                    scan_document_ocr(uploaded_file)
         
         return uploaded_file
     
@@ -107,65 +110,58 @@ def render_upload_section():
         return None
 
 
-def process_document(uploaded_file):
-    """Process the uploaded document with Gemini API."""
+def scan_document_ocr(uploaded_file):
+    """Scan document with OCR to filter pages with questions."""
 
-    with st.spinner("Analyzing your document... This may take 30-120 seconds."):
+    with st.spinner("Scanning document with OCR... This takes 0.5-1 second per page."):
         progress_bar = st.progress(0)
         status_text = st.empty()
 
         try:
+            # Reset state
+            st.session_state.ocr_filtering_complete = False
+            st.session_state.filtered_pages = []
+            st.session_state.filtered_page_numbers = []
             st.session_state.processing_complete = False
             st.session_state.results = None
 
-            status_text.text("Step 1/4: Reading file...")
-            progress_bar.progress(15)
+            status_text.text("Reading PDF...")
+            progress_bar.progress(5)
             pdf_bytes = uploaded_file.getvalue()
+            
+            # Get total page count
+            total_pages = get_page_count(pdf_bytes)
+            st.session_state.total_pages = total_pages
 
-            status_text.text("Step 2/4: Preparing request...")
-            progress_bar.progress(35)
-
-            cfg = GeminiConfig(
-                api_key=st.session_state.api_key,
-                temperature=st.session_state.temperature,
-                max_output_tokens=st.session_state.max_tokens,
-            )
-
-            status_text.text("Step 3/5: Validating PDF...")
-            progress_bar.progress(40)
+            status_text.text(f"Starting OCR scan on {total_pages} pages...")
+            progress_bar.progress(10)
 
             def update_progress(msg: str, pct: float):
                 status_text.text(msg)
-                # Map pct (0.0-1.0) to progress bar range 40-95
-                bar_pct = int(40 + (pct * 55))
-                progress_bar.progress(bar_pct)
+                # Map pct (0.0-1.0) to progress bar range 10-95
+                bar_pct = int(10 + (pct * 85))
+                progress_bar.progress(min(bar_pct, 95))
 
-            # Choose extraction method based on mode
-            if st.session_state.get('extraction_mode') == "Page-by-Page (Detailed)":
-                results = extract_create_quiz_dto_by_page(
-                    pdf_bytes=pdf_bytes,
-                    filename=uploaded_file.name,
-                    cfg=cfg,
-                    progress_callback=update_progress,
-                )
-            else:
-                results = extract_create_quiz_dto_from_pdf_bytes(
-                    pdf_bytes=pdf_bytes,
-                    filename=uploaded_file.name,
-                    cfg=cfg,
-                    progress_callback=update_progress,
-                )
+            # Run OCR filtering
+            filtered_page_numbers, filtered_page_pdfs = filter_pages_with_questions(
+                pdf_bytes=pdf_bytes,
+                progress_callback=update_progress,
+            )
 
-            status_text.text("Step 5/5: Finalizing...")
-            progress_bar.progress(95)
-
-            st.session_state.results = results
-            st.session_state.processing_complete = True
+            # Store in session state
+            st.session_state.filtered_pages = filtered_page_pdfs
+            st.session_state.filtered_page_numbers = filtered_page_numbers
+            st.session_state.ocr_filtering_complete = True
 
             progress_bar.progress(100)
-            status_text.text("✅ Extraction complete!")
+            status_text.text(f"✅ Found {len(filtered_page_pdfs)} pages with questions!")
+            
+            st.success(f"OCR scan complete! Found **{len(filtered_page_pdfs)}** pages with questions out of **{total_pages}** total pages.")
+            st.balloons()
 
         except Exception as e:
-            st.error(f"Error processing document: {str(e)}")
-            st.session_state.processing_complete = False
-            st.session_state.results = None
+            st.error(f"Error during OCR scanning: {str(e)}")
+            import traceback
+            with st.expander("Error Details"):
+                st.code(traceback.format_exc())
+            st.session_state.ocr_filtering_complete = False

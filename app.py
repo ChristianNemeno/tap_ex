@@ -16,6 +16,7 @@ from core.logging_utils import get_logger
 from ui.components import load_css, render_header, render_footer
 from ui.sidebar import render_sidebar
 from ui.upload import render_upload_section
+from ui.filtered_pages import render_filtered_pages_section
 from ui.results import render_results_section
 from ui.export import render_export_section
 
@@ -72,6 +73,10 @@ def main():
     
     # Upload section
     render_upload_section()
+    
+    # Filtered pages review section (after OCR)
+    if st.session_state.ocr_filtering_complete:
+        render_filtered_pages_section()
     
     # Results section
     if st.session_state.processing_complete:

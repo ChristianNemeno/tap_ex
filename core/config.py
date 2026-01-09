@@ -18,6 +18,12 @@ def get_session_state_defaults() -> Dict[str, Any]:
         'quiz_json_validation_errors': None,
         'uploaded_file_name': None,
         'processing_complete': False,
+        
+        # OCR filtered pages (before AI processing)
+        'filtered_pages': [],  # List of page PDFs (bytes)
+        'filtered_page_numbers': [],  # List of page numbers
+        'total_pages': 0,  # Total pages in original PDF
+        'ocr_filtering_complete': False,
 
         # Backend API settings
         'backend_base_url': os.getenv('TAPCET_API_BASE_URL', 'https://localhost:7237'),

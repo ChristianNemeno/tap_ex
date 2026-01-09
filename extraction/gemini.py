@@ -16,11 +16,264 @@ import io
 
 import google.generativeai as genai
 from pypdf import PdfReader
+from pdf2image import convert_from_bytes
+import pytesseract
+
+if os.name == 'nt':  # Windows
+    tesseract_path = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    if os.path.exists(tesseract_path):
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+    
 
 from extraction.pdf_utils import split_pdf_into_chunks, split_pdf_into_single_pages, get_page_count
 
 
 DEFAULT_MODEL_NAME = "gemini-3-flash-preview"
+
+
+def detect_questions_in_page(page_bytes: bytes) -> Dict[str, Any]:
+    """Use OCR to detect if a page contains questions or answer keys.
+    
+    Args:
+        page_bytes: Single-page PDF bytes
+        
+    Returns:
+        Dictionary with:
+        - has_questions: bool
+        - has_answer_key: bool
+        - question_count_estimate: int
+        - patterns_found: list of detected patterns
+    """
+    try:
+        # Convert PDF page to image
+        images = convert_from_bytes(page_bytes, dpi=200)
+        if not images:
+            return {"has_questions": False, "has_answer_key": False, "question_count_estimate": 0, "patterns_found": []}
+        
+        # OCR the first (and only) page
+        text = pytesseract.image_to_string(images[0])
+        text_lower = text.lower()
+        
+        patterns_found = []
+        has_questions = False
+        has_answer_key = False
+        question_count = 0
+        
+        # Pattern 1: Multiple choice options (A), B), C), D)
+        mc_pattern = re.compile(r'[A-F]\s*[.):]', re.IGNORECASE)
+        mc_matches = mc_pattern.findall(text)
+        if len(mc_matches) >= 3:  # At least 3 options suggest a question
+            patterns_found.append("multiple_choice_letters")
+            has_questions = True
+            # Rough estimate: divide by 4 (assuming 4 options per question)
+            question_count += len(mc_matches) // 4
+        
+        # Pattern 2: Numbered questions (1., 2., 3. or 1), 2), 3))
+        numbered_pattern = re.compile(r'^\s*\d{1,3}\s*[.):]', re.MULTILINE)
+        numbered_matches = numbered_pattern.findall(text)
+        if len(numbered_matches) >= 2:
+            patterns_found.append("numbered_questions")
+            has_questions = True
+            question_count = max(question_count, len(numbered_matches))
+        
+        # Pattern 3: Answer key indicators
+        answer_key_keywords = [
+            'answer key', 'answer sheet', 'correct answers', 'solutions',
+            'answer guide', 'key:', 'answers:'
+        ]
+        for keyword in answer_key_keywords:
+            if keyword in text_lower:
+                patterns_found.append(f"answer_key_keyword: {keyword}")
+                has_answer_key = True
+                break
+        
+        # Pattern 4: Grid-style answer key (e.g., "1. A  2. B  3. C")
+        answer_grid_pattern = re.compile(r'\d+\s*[.)]\s*[A-F]', re.IGNORECASE)
+        answer_grid_matches = answer_grid_pattern.findall(text)
+        if len(answer_grid_matches) >= 5:  # 5+ answers in grid format
+            patterns_found.append("answer_grid")
+            has_answer_key = True
+        
+        # Pattern 5: Question stems ("What is", "Which of", "Select", etc.)
+        question_stems = [
+            'what is', 'what are', 'which of', 'select the', 'choose the',
+            'identify', 'find the', 'calculate', 'determine'
+        ]
+        stem_count = sum(1 for stem in question_stems if stem in text_lower)
+        if stem_count >= 2:
+            patterns_found.append("question_stems")
+            has_questions = True
+        
+        return {
+            "has_questions": has_questions,
+            "has_answer_key": has_answer_key,
+            "question_count_estimate": question_count,
+            "patterns_found": patterns_found,
+        }
+        
+    except Exception as e:
+        # If OCR fails, assume page might have content (fail-safe)
+        return {
+            "has_questions": True,  # Fail-safe: include page if OCR fails
+            "has_answer_key": False,
+            "question_count_estimate": 0,
+            "patterns_found": [f"ocr_error: {str(e)}"],
+        }
+
+
+def filter_pages_with_questions(
+    pdf_bytes: bytes,
+    progress_callback: Optional[Callable[[str, float], None]] = None,
+) -> Tuple[List[int], List[bytes]]:
+    """Filter PDF pages to find those with questions or answer keys using OCR.
+    
+    Args:
+        pdf_bytes: Original PDF bytes
+        progress_callback: Optional callback for progress updates
+        
+    Returns:
+        Tuple of (page_numbers, page_pdfs) for pages that contain questions/answers
+    """
+    if progress_callback:
+        progress_callback("Splitting PDF into pages for OCR filtering...", 0.0)
+    
+    # Split into single pages
+    single_page_pdfs = split_pdf_into_single_pages(pdf_bytes)
+    total_pages = len(single_page_pdfs)
+    
+    if progress_callback:
+        progress_callback(f"OCR scanning {total_pages} pages for questions...", 0.05)
+    
+    filtered_page_numbers = []
+    filtered_page_pdfs = []
+    
+    for idx, page_pdf in enumerate(single_page_pdfs):
+        page_num = idx + 1
+        
+        if progress_callback and idx % 5 == 0:  # Update every 5 pages
+            progress = 0.05 + (0.25 * (idx / total_pages))
+            progress_callback(f"OCR scanning page {page_num}/{total_pages}...", progress)
+        
+        # Use OCR to detect questions
+        detection = detect_questions_in_page(page_pdf)
+        
+        # Include page if it has questions or answer keys
+        if detection["has_questions"] or detection["has_answer_key"]:
+            filtered_page_numbers.append(page_num)
+            filtered_page_pdfs.append(page_pdf)
+    
+    if progress_callback:
+        progress_callback(
+            f"OCR filtering complete: {len(filtered_page_numbers)}/{total_pages} pages contain questions",
+            1.0
+        )
+    
+    return filtered_page_numbers, filtered_page_pdfs
+
+
+def process_filtered_pages_with_ai(
+    filtered_page_pdfs: List[bytes],
+    filtered_page_numbers: List[int],
+    filename: str,
+    cfg: GeminiConfig,
+    progress_callback: Optional[Callable[[str, float], None]] = None,
+) -> Dict[str, Any]:
+    """Process pre-filtered pages with Gemini AI.
+    
+    Args:
+        filtered_page_pdfs: List of filtered page PDFs (bytes)
+        filtered_page_numbers: Corresponding page numbers
+        filename: Original PDF filename
+        cfg: Gemini configuration
+        progress_callback: Optional callback for progress updates
+        
+    Returns:
+        Dictionary with title, description, and pages array containing questions per page
+    """
+    if not cfg.api_key:
+        raise ValueError("Missing GEMINI_API_KEY")
+    
+    if not filtered_page_pdfs:
+        return {
+            "title": f"Quiz from {filename}",
+            "description": "No pages to process",
+            "pages": [],
+            "filteredPages": 0,
+        }
+    
+    if progress_callback:
+        progress_callback(
+            f"Processing {len(filtered_page_pdfs)} pages with AI...",
+            0.0
+        )
+
+    # Configure Gemini
+    genai.configure(api_key=cfg.api_key)
+    generation_config: Dict[str, Any] = {
+        "temperature": float(cfg.temperature),
+        "max_output_tokens": int(cfg.max_output_tokens),
+        "response_mime_type": "application/json",
+    }
+    model = genai.GenerativeModel(model_name=cfg.model_name, generation_config=generation_config)
+
+    # Process pages in batches of 10 (Gemini upload limit) with rate limiting (5 RPM)
+    batch_size = 10
+    rpm_limit = 5
+    seconds_per_request = 60.0 / rpm_limit  # 12 seconds between requests for 5 RPM
+    
+    num_batches = (len(filtered_page_pdfs) + batch_size - 1) // batch_size
+    pages_with_questions: List[Dict[str, Any]] = []
+    last_request_time = 0.0
+
+    for batch_idx in range(num_batches):
+        # Rate limiting: ensure we don't exceed 5 RPM
+        if batch_idx > 0:
+            elapsed = time.time() - last_request_time
+            if elapsed < seconds_per_request:
+                wait_time = seconds_per_request - elapsed
+                if progress_callback:
+                    progress_callback(
+                        f"Rate limiting: waiting {wait_time:.1f}s (5 RPM limit)...",
+                        (batch_idx / num_batches),
+                    )
+                time.sleep(wait_time)
+        
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(filtered_page_pdfs))
+        batch_pages = filtered_page_pdfs[batch_start:batch_end]
+        batch_page_numbers = filtered_page_numbers[batch_start:batch_end]
+
+        if progress_callback:
+            progress_callback(
+                f"AI processing pages {batch_start + 1}-{batch_end}/{len(filtered_page_pdfs)}...",
+                (batch_idx / num_batches),
+            )
+
+        last_request_time = time.time()
+        batch_results = _process_pages_batch_with_page_numbers(
+            batch_pages, 
+            batch_page_numbers,
+            model, 
+            filename
+        )
+        pages_with_questions.extend(batch_results)
+
+    if progress_callback:
+        progress_callback(f"Completed: {len(filtered_page_pdfs)} pages processed", 1.0)
+
+    # Build final result
+    title = f"Quiz from {filename}"
+    if len(title) > 200:
+        title = title[:197] + "..."
+
+    result = {
+        "title": title,
+        "description": f"Extracted from {len(filtered_page_pdfs)} pages with questions",
+        "pages": pages_with_questions,
+        "filteredPages": len(filtered_page_pdfs),
+    }
+
+    return result
 
 
 MCQ_CREATE_QUIZ_PROMPT = """
@@ -183,10 +436,12 @@ def extract_create_quiz_dto_by_page(
     cfg: GeminiConfig,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
-    """Extract questions page-by-page with rate limiting.
+    """Extract questions page-by-page with OCR pre-filtering and rate limiting.
     
-    Splits PDF into single-page PDFs, processes in batches of 10 (Gemini limit),
-    with 5 RPM rate limiting. Returns results grouped by page.
+    Workflow:
+    1. OCR all pages to detect questions/answer keys (fast, cheap)
+    2. Filter to only relevant pages
+    3. Process filtered pages with Gemini AI (slow, expensive)
     
     Args:
         pdf_bytes: Original PDF bytes
@@ -200,22 +455,39 @@ def extract_create_quiz_dto_by_page(
     if not cfg.api_key:
         raise ValueError("Missing GEMINI_API_KEY")
 
-    # Validate page count
+    # Get total page count
     total_pages = get_page_count(pdf_bytes)
     if total_pages > cfg.max_pages:
         raise ValueError(f"PDF has {total_pages} pages (max allowed: {cfg.max_pages})")
 
     if progress_callback:
-        progress_callback(f"Splitting {total_pages} pages...", 0.05)
+        progress_callback(f"Starting OCR pre-filtering on {total_pages} pages...", 0.0)
 
-    # Split into single-page PDFs
-    single_page_pdfs = split_pdf_into_single_pages(pdf_bytes)
-    if not single_page_pdfs:
-        raise ValueError("Failed to split PDF into pages")
-
+    # STEP 1: OCR filter to find pages with questions (0.0 - 0.3 progress)
+    filtered_page_numbers, filtered_page_pdfs = filter_pages_with_questions(
+        pdf_bytes,
+        progress_callback=progress_callback
+    )
+    
+    if not filtered_page_pdfs:
+        # No pages with questions found
+        if progress_callback:
+            progress_callback("No pages with questions detected", 1.0)
+        return {
+            "title": f"Quiz from {filename}",
+            "description": f"No questions found in {total_pages}-page PDF",
+            "pages": [],
+            "totalPages": total_pages,
+            "filteredPages": 0,
+        }
+    
     if progress_callback:
-        progress_callback(f"Created {len(single_page_pdfs)} single-page PDFs", 0.1)
+        progress_callback(
+            f"Processing {len(filtered_page_pdfs)} pages with AI (filtered from {total_pages})...",
+            0.35
+        )
 
+    # STEP 2: Process filtered pages with Gemini AI (0.35 - 0.95 progress)
     genai.configure(api_key=cfg.api_key)
     generation_config: Dict[str, Any] = {
         "temperature": float(cfg.temperature),
@@ -229,7 +501,7 @@ def extract_create_quiz_dto_by_page(
     rpm_limit = 5
     seconds_per_request = 60.0 / rpm_limit  # 12 seconds between requests for 5 RPM
     
-    num_batches = (len(single_page_pdfs) + batch_size - 1) // batch_size
+    num_batches = (len(filtered_page_pdfs) + batch_size - 1) // batch_size
     pages_with_questions: List[Dict[str, Any]] = []
     last_request_time = 0.0
 
@@ -242,31 +514,32 @@ def extract_create_quiz_dto_by_page(
                 if progress_callback:
                     progress_callback(
                         f"Rate limiting: waiting {wait_time:.1f}s (5 RPM limit)...",
-                        0.1 + (0.8 * (batch_idx / num_batches)),
+                        0.35 + (0.6 * (batch_idx / num_batches)),
                     )
                 time.sleep(wait_time)
         
         batch_start = batch_idx * batch_size
-        batch_end = min(batch_start + batch_size, len(single_page_pdfs))
-        batch_pages = single_page_pdfs[batch_start:batch_end]
+        batch_end = min(batch_start + batch_size, len(filtered_page_pdfs))
+        batch_pages = filtered_page_pdfs[batch_start:batch_end]
+        batch_page_numbers = filtered_page_numbers[batch_start:batch_end]
 
         if progress_callback:
             progress_callback(
-                f"Processing pages {batch_start + 1}-{batch_end}/{total_pages}...",
-                0.1 + (0.8 * (batch_idx / num_batches)),
+                f"AI processing filtered pages {batch_start + 1}-{batch_end}/{len(filtered_page_pdfs)}...",
+                0.35 + (0.6 * (batch_idx / num_batches)),
             )
 
         last_request_time = time.time()
-        batch_results = _process_pages_batch(
+        batch_results = _process_pages_batch_with_page_numbers(
             batch_pages, 
+            batch_page_numbers,
             model, 
-            filename, 
-            batch_start
+            filename
         )
         pages_with_questions.extend(batch_results)
 
     if progress_callback:
-        progress_callback(f"Completed processing {total_pages} pages", 0.95)
+        progress_callback(f"Completed: {len(filtered_page_pdfs)} pages processed", 0.95)
 
     # Build final result with page-grouped questions
     title = f"Quiz from {filename}"
@@ -275,9 +548,10 @@ def extract_create_quiz_dto_by_page(
 
     result = {
         "title": title,
-        "description": f"Extracted from {total_pages}-page PDF (page-by-page)",
+        "description": f"Extracted from {total_pages}-page PDF ({len(filtered_page_pdfs)} pages with questions)",
         "pages": pages_with_questions,  # Array of {pageNumber, questions[]}
         "totalPages": total_pages,
+        "filteredPages": len(filtered_page_pdfs),
     }
 
     return result
@@ -300,6 +574,27 @@ def _process_pages_batch(
     Returns:
         List of dicts with pageNumber and questions array
     """
+    page_numbers = [batch_offset + i + 1 for i in range(len(page_pdfs))]
+    return _process_pages_batch_with_page_numbers(page_pdfs, page_numbers, model, base_filename)
+
+
+def _process_pages_batch_with_page_numbers(
+    page_pdfs: List[bytes],
+    page_numbers: List[int],
+    model: Any,
+    base_filename: str,
+) -> List[Dict[str, Any]]:
+    """Process a batch of single-page PDFs with explicit page numbers.
+    
+    Args:
+        page_pdfs: List of single-page PDF bytes
+        page_numbers: Corresponding page numbers for each PDF
+        model: Gemini model instance
+        base_filename: Original filename
+        
+    Returns:
+        List of dicts with pageNumber and questions array
+    """
     uploaded_files = []
     tmp_paths: List[str] = []
     results: List[Dict[str, Any]] = []
@@ -307,7 +602,7 @@ def _process_pages_batch(
     try:
         # Upload all pages in this batch
         for i, page_bytes in enumerate(page_pdfs):
-            page_num = batch_offset + i + 1  # 1-indexed page numbers
+            page_num = page_numbers[i]
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(page_bytes)
                 tmp.flush()

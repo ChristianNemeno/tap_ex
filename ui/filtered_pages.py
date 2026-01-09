@@ -1,24 +1,6 @@
-"""UI component for displaying and managing filtered PDF pages."""
+"""UI component for displaying and managing filtered pages with OCR text."""
 
 import streamlit as st
-from io import BytesIO
-import base64
-import os
-from pdf2image import convert_from_bytes
-
-# Configure poppler path for Windows
-POPPLER_PATH = None
-if os.name == 'nt':  # Windows
-    possible_paths = [
-        r'C:\poppler\Release-25.12.0-0\poppler-25.12.0\Library\bin',
-        r'C:\Program Files\poppler\Library\bin',
-        r'C:\poppler\Library\bin',
-        r"C:\poppler\Release-25.12.0-0\poppler-25.12.0\Library\bin"
-    ]
-    for path in possible_paths:
-        if os.path.exists(path):
-            POPPLER_PATH = path
-            break
 
 
 def render_filtered_pages_section():
@@ -33,20 +15,19 @@ def render_filtered_pages_section():
     total_pages = st.session_state.total_pages
     
     if filtered_count == 0:
-        st.warning(f"No pages with questions detected out of {total_pages} total pages.")
-        st.info("The OCR filter looks for multiple choice options, numbered questions, answer keys, and question patterns.")
+        st.warning(f"No pages extracted from PDF.")
         return
     
-    st.success(f"Found **{filtered_count}** pages with questions out of **{total_pages}** total pages")
+    st.success(f"Extracted text from **{filtered_count}** pages (all pages)")
     
     # Summary info with better visibility
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     
     with col1:
         st.markdown(f"""
         <div style='text-align: center; padding: 1rem; background-color: #f0f2f6; border-radius: 10px;'>
             <h3 style='color: #0068c9; margin: 0;'>{filtered_count}</h3>
-            <p style='color: #262730; margin: 0;'>Pages with Questions</p>
+            <p style='color: #262730; margin: 0;'>Pages Extracted</p>
         </div>
         """, unsafe_allow_html=True)
     
@@ -58,23 +39,14 @@ def render_filtered_pages_section():
         </div>
         """, unsafe_allow_html=True)
     
-    with col3:
-        reduction = int((1 - filtered_count / total_pages) * 100) if total_pages > 0 else 0
-        st.markdown(f"""
-        <div style='text-align: center; padding: 1rem; background-color: #f0f2f6; border-radius: 10px;'>
-            <h3 style='color: #00c853; margin: 0;'>{reduction}%</h3>
-            <p style='color: #262730; margin: 0;'>AI Cost Reduction</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
     st.markdown("---")
     
     # Display filtered pages
-    st.subheader("Review and Edit Filtered Pages")
-    st.caption("Remove any pages that don't contain questions before processing with AI")
+    st.subheader("Review Extracted Text")
+    st.caption("Remove any pages you don't want to process with AI")
     
     # Create columns for page display
-    cols_per_row = 3
+    cols_per_row = 2  # Reduced to 2 columns for better text readability
     pages_data = list(zip(
         st.session_state.filtered_page_numbers,
         st.session_state.filtered_pages
@@ -88,50 +60,46 @@ def render_filtered_pages_section():
             if page_idx >= len(pages_data):
                 break
             
-            page_num, page_pdf = pages_data[page_idx]
+            page_num, page_text = pages_data[page_idx]
             
             with col:
                 with st.container(border=True):
                     st.markdown(f"**Page {page_num}**")
                     
-                    # Show PDF preview as image
-                    try:
-                        images = convert_from_bytes(
-                            page_pdf, 
-                            dpi=150, 
-                            first_page=1, 
-                            last_page=1,
-                            poppler_path=POPPLER_PATH
+                    # Debug: Show if text is empty
+                    if not page_text or len(page_text.strip()) == 0:
+                        st.warning("⚠️ No text extracted from this page")
+                        st.caption("OCR may have failed or page contains only images")
+                    else:
+                        # Show text preview (first 500 characters)
+                        preview_text = page_text[:500] + "..." if len(page_text) > 500 else page_text
+                        st.text_area(
+                            "Content Preview",
+                            value=preview_text,
+                            height=200,
+                            key=f"preview_{page_num}",
+                            label_visibility="collapsed"
                         )
-                        if images:
-                            st.image(images[0], use_container_width=True)
-                    except Exception as e:
-                        st.error(f"Preview unavailable")
-                        st.caption(f"Error: {str(e)[:100]}")
-                        if "poppler" in str(e).lower():
-                            st.caption("⚠️ Poppler not found. Add to PATH or check installation.")
+                        
+                        st.caption(f"Text length: {len(page_text)} characters")
                     
-                    st.caption(f"Size: {len(page_pdf) / 1024:.1f} KB")
-                    
-                    # Action buttons in columns
+                    # Action buttons
                     btn_col1, btn_col2 = st.columns(2)
                     
                     with btn_col1:
-                        # Download button for this page
-                        st.download_button(
-                            label="📥",
-                            data=page_pdf,
-                            file_name=f"page_{page_num}.pdf",
-                            mime="application/pdf",
-                            key=f"download_page_{page_num}",
+                        # View full text
+                        if st.button(
+                            "👁️ View Full",
+                            key=f"view_page_{page_num}",
                             use_container_width=True,
-                            help="Download this page"
-                        )
+                            help="View complete text"
+                        ):
+                            st.session_state[f"show_full_{page_num}"] = True
                     
                     with btn_col2:
                         # Remove button
                         if st.button(
-                            "🗑️",
+                            "🗑️ Remove",
                             key=f"remove_page_{page_num}",
                             use_container_width=True,
                             type="secondary",
@@ -139,6 +107,20 @@ def render_filtered_pages_section():
                         ):
                             remove_page(page_idx)
                             st.rerun()
+                    
+                    # Show full text in expander if requested
+                    if st.session_state.get(f"show_full_{page_num}", False):
+                        with st.expander("Full Page Text", expanded=True):
+                            st.text_area(
+                                f"Full text from page {page_num}",
+                                value=page_text,
+                                height=400,
+                                key=f"full_{page_num}",
+                                label_visibility="collapsed"
+                            )
+                            if st.button("Close", key=f"close_{page_num}"):
+                                st.session_state[f"show_full_{page_num}"] = False
+                                st.rerun()
     
     st.markdown("---")
     
@@ -193,7 +175,7 @@ def clear_all_pages():
 
 def process_with_ai():
     """Process the filtered pages with Gemini AI."""
-    from extraction.gemini import GeminiConfig, process_filtered_pages_with_ai
+    from extraction.gemini import GeminiConfig, process_pages_with_ai
     
     with st.spinner("Processing with Gemini AI... This may take 1-5 minutes."):
         progress_bar = st.progress(0)
@@ -210,9 +192,9 @@ def process_with_ai():
                 status_text.text(msg)
                 progress_bar.progress(min(int(pct * 100), 100))
             
-            results = process_filtered_pages_with_ai(
-                filtered_page_pdfs=st.session_state.filtered_pages,
-                filtered_page_numbers=st.session_state.filtered_page_numbers,
+            results = process_pages_with_ai(
+                ocr_texts=st.session_state.filtered_pages,
+                page_numbers=st.session_state.filtered_page_numbers,
                 filename=st.session_state.uploaded_file_name or "document.pdf",
                 cfg=cfg,
                 progress_callback=update_progress,

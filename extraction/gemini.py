@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Callable, Tuple
@@ -24,6 +23,18 @@ if os.name == 'nt':  # Windows
     if os.path.exists(tesseract_path):
         pytesseract.pytesseract.tesseract_cmd = tesseract_path
     
+    # Configure Poppler path for pdf2image
+    poppler_paths = [
+        r'C:\poppler\Release-25.12.0-0\poppler-25.12.0\Library\bin',
+        r'C:\Program Files\poppler\bin',
+        r'C:\poppler\bin',
+    ]
+    POPPLER_PATH = None
+    for path in poppler_paths:
+        if os.path.exists(path):
+            POPPLER_PATH = path
+            break
+    
 
 from extraction.pdf_utils import split_pdf_into_chunks, split_pdf_into_single_pages, get_page_count
 
@@ -31,158 +42,83 @@ from extraction.pdf_utils import split_pdf_into_chunks, split_pdf_into_single_pa
 DEFAULT_MODEL_NAME = "gemini-3-flash-preview"
 
 
-def detect_questions_in_page(page_bytes: bytes) -> Dict[str, Any]:
-    """Use OCR to detect if a page contains questions or answer keys.
-    
-    Args:
-        page_bytes: Single-page PDF bytes
-        
-    Returns:
-        Dictionary with:
-        - has_questions: bool
-        - has_answer_key: bool
-        - question_count_estimate: int
-        - patterns_found: list of detected patterns
-    """
-    try:
-        # Convert PDF page to image
-        images = convert_from_bytes(page_bytes, dpi=200)
-        if not images:
-            return {"has_questions": False, "has_answer_key": False, "question_count_estimate": 0, "patterns_found": []}
-        
-        # OCR the first (and only) page
-        text = pytesseract.image_to_string(images[0])
-        text_lower = text.lower()
-        
-        patterns_found = []
-        has_questions = False
-        has_answer_key = False
-        question_count = 0
-        
-        # Pattern 1: Multiple choice options (A), B), C), D)
-        mc_pattern = re.compile(r'[A-F]\s*[.):]', re.IGNORECASE)
-        mc_matches = mc_pattern.findall(text)
-        if len(mc_matches) >= 3:  # At least 3 options suggest a question
-            patterns_found.append("multiple_choice_letters")
-            has_questions = True
-            # Rough estimate: divide by 4 (assuming 4 options per question)
-            question_count += len(mc_matches) // 4
-        
-        # Pattern 2: Numbered questions (1., 2., 3. or 1), 2), 3))
-        numbered_pattern = re.compile(r'^\s*\d{1,3}\s*[.):]', re.MULTILINE)
-        numbered_matches = numbered_pattern.findall(text)
-        if len(numbered_matches) >= 2:
-            patterns_found.append("numbered_questions")
-            has_questions = True
-            question_count = max(question_count, len(numbered_matches))
-        
-        # Pattern 3: Answer key indicators
-        answer_key_keywords = [
-            'answer key', 'answer sheet', 'correct answers', 'solutions',
-            'answer guide', 'key:', 'answers:'
-        ]
-        for keyword in answer_key_keywords:
-            if keyword in text_lower:
-                patterns_found.append(f"answer_key_keyword: {keyword}")
-                has_answer_key = True
-                break
-        
-        # Pattern 4: Grid-style answer key (e.g., "1. A  2. B  3. C")
-        answer_grid_pattern = re.compile(r'\d+\s*[.)]\s*[A-F]', re.IGNORECASE)
-        answer_grid_matches = answer_grid_pattern.findall(text)
-        if len(answer_grid_matches) >= 5:  # 5+ answers in grid format
-            patterns_found.append("answer_grid")
-            has_answer_key = True
-        
-        # Pattern 5: Question stems ("What is", "Which of", "Select", etc.)
-        question_stems = [
-            'what is', 'what are', 'which of', 'select the', 'choose the',
-            'identify', 'find the', 'calculate', 'determine'
-        ]
-        stem_count = sum(1 for stem in question_stems if stem in text_lower)
-        if stem_count >= 2:
-            patterns_found.append("question_stems")
-            has_questions = True
-        
-        return {
-            "has_questions": has_questions,
-            "has_answer_key": has_answer_key,
-            "question_count_estimate": question_count,
-            "patterns_found": patterns_found,
-        }
-        
-    except Exception as e:
-        # If OCR fails, assume page might have content (fail-safe)
-        return {
-            "has_questions": True,  # Fail-safe: include page if OCR fails
-            "has_answer_key": False,
-            "question_count_estimate": 0,
-            "patterns_found": [f"ocr_error: {str(e)}"],
-        }
-
-
-def filter_pages_with_questions(
+def extract_ocr_text_from_all_pages(
     pdf_bytes: bytes,
     progress_callback: Optional[Callable[[str, float], None]] = None,
-) -> Tuple[List[int], List[bytes]]:
-    """Filter PDF pages to find those with questions or answer keys using OCR.
+) -> Tuple[List[int], List[str]]:
+    """Extract OCR text from all PDF pages without filtering.
     
     Args:
         pdf_bytes: Original PDF bytes
         progress_callback: Optional callback for progress updates
         
     Returns:
-        Tuple of (page_numbers, page_pdfs) for pages that contain questions/answers
+        Tuple of (page_numbers, ocr_texts) for all pages
     """
     if progress_callback:
-        progress_callback("Splitting PDF into pages for OCR filtering...", 0.0)
+        progress_callback("Splitting PDF into pages for OCR extraction...", 0.0)
     
     # Split into single pages
     single_page_pdfs = split_pdf_into_single_pages(pdf_bytes)
     total_pages = len(single_page_pdfs)
     
     if progress_callback:
-        progress_callback(f"OCR scanning {total_pages} pages for questions...", 0.05)
+        progress_callback(f"Extracting text from {total_pages} pages...", 0.05)
     
-    filtered_page_numbers = []
-    filtered_page_pdfs = []
+    page_numbers = []
+    ocr_texts = []
     
     for idx, page_pdf in enumerate(single_page_pdfs):
         page_num = idx + 1
         
         if progress_callback and idx % 5 == 0:  # Update every 5 pages
-            progress = 0.05 + (0.25 * (idx / total_pages))
-            progress_callback(f"OCR scanning page {page_num}/{total_pages}...", progress)
+            progress = 0.05 + (0.90 * (idx / total_pages))
+            progress_callback(f"Extracting text from page {page_num}/{total_pages}...", progress)
         
-        # Use OCR to detect questions
-        detection = detect_questions_in_page(page_pdf)
+        # Extract OCR text from page
+        try:
+            # Convert PDF page to image
+            convert_kwargs = {'dpi': 200}
+            if os.name == 'nt' and POPPLER_PATH:
+                convert_kwargs['poppler_path'] = POPPLER_PATH
+            
+            images = convert_from_bytes(page_pdf, **convert_kwargs)
+            if images:
+                # OCR the page
+                text = pytesseract.image_to_string(images[0])
+                print(f"[OCR DEBUG] Page {page_num}: Extracted {len(text)} chars")
+            else:
+                text = ""
+                print(f"[OCR DEBUG] Page {page_num}: No image extracted")
+        except Exception as e:
+            text = ""
+            print(f"[OCR DEBUG] Page {page_num}: Error - {str(e)}")
         
-        # Include page if it has questions or answer keys
-        if detection["has_questions"] or detection["has_answer_key"]:
-            filtered_page_numbers.append(page_num)
-            filtered_page_pdfs.append(page_pdf)
+        # Include all pages regardless of content
+        page_numbers.append(page_num)
+        ocr_texts.append(text)
     
     if progress_callback:
         progress_callback(
-            f"OCR filtering complete: {len(filtered_page_numbers)}/{total_pages} pages contain questions",
+            f"OCR extraction complete: {total_pages} pages processed",
             1.0
         )
     
-    return filtered_page_numbers, filtered_page_pdfs
+    return page_numbers, ocr_texts
 
 
-def process_filtered_pages_with_ai(
-    filtered_page_pdfs: List[bytes],
-    filtered_page_numbers: List[int],
+def process_pages_with_ai(
+    ocr_texts: List[str],
+    page_numbers: List[int],
     filename: str,
     cfg: GeminiConfig,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
-    """Process pre-filtered pages with Gemini AI.
+    """Process OCR text from pages with Gemini AI.
     
     Args:
-        filtered_page_pdfs: List of filtered page PDFs (bytes)
-        filtered_page_numbers: Corresponding page numbers
+        ocr_texts: List of OCR text from pages
+        page_numbers: Corresponding page numbers
         filename: Original PDF filename
         cfg: Gemini configuration
         progress_callback: Optional callback for progress updates
@@ -193,17 +129,17 @@ def process_filtered_pages_with_ai(
     if not cfg.api_key:
         raise ValueError("Missing GEMINI_API_KEY")
     
-    if not filtered_page_pdfs:
+    if not ocr_texts:
         return {
             "title": f"Quiz from {filename}",
             "description": "No pages to process",
             "pages": [],
-            "filteredPages": 0,
+            "totalPages": 0,
         }
     
     if progress_callback:
         progress_callback(
-            f"Processing {len(filtered_page_pdfs)} pages with AI...",
+            f"Processing {len(ocr_texts)} pages with AI...",
             0.0
         )
 
@@ -216,50 +152,76 @@ def process_filtered_pages_with_ai(
     }
     model = genai.GenerativeModel(model_name=cfg.model_name, generation_config=generation_config)
 
-    # Process pages in batches of 10 (Gemini upload limit) with rate limiting (5 RPM)
-    batch_size = 10
+    # Process pages with rate limiting (5 RPM for free tier)
     rpm_limit = 5
-    seconds_per_request = 60.0 / rpm_limit  # 12 seconds between requests for 5 RPM
+    seconds_per_request = 60.0 / rpm_limit  # 12 seconds between requests
     
-    num_batches = (len(filtered_page_pdfs) + batch_size - 1) // batch_size
     pages_with_questions: List[Dict[str, Any]] = []
     last_request_time = 0.0
 
-    for batch_idx in range(num_batches):
-        # Rate limiting: ensure we don't exceed 5 RPM
-        if batch_idx > 0:
+    for idx, (page_text, page_num) in enumerate(zip(ocr_texts, page_numbers)):
+        # Rate limiting
+        if idx > 0:
             elapsed = time.time() - last_request_time
             if elapsed < seconds_per_request:
                 wait_time = seconds_per_request - elapsed
                 if progress_callback:
                     progress_callback(
                         f"Rate limiting: waiting {wait_time:.1f}s (5 RPM limit)...",
-                        (batch_idx / num_batches),
+                        idx / len(ocr_texts),
                     )
                 time.sleep(wait_time)
-        
-        batch_start = batch_idx * batch_size
-        batch_end = min(batch_start + batch_size, len(filtered_page_pdfs))
-        batch_pages = filtered_page_pdfs[batch_start:batch_end]
-        batch_page_numbers = filtered_page_numbers[batch_start:batch_end]
 
         if progress_callback:
             progress_callback(
-                f"AI processing pages {batch_start + 1}-{batch_end}/{len(filtered_page_pdfs)}...",
-                (batch_idx / num_batches),
+                f"AI processing page {page_num} ({idx + 1}/{len(ocr_texts)})...",
+                idx / len(ocr_texts),
             )
 
         last_request_time = time.time()
-        batch_results = _process_pages_batch_with_page_numbers(
-            batch_pages, 
-            batch_page_numbers,
-            model, 
-            filename
-        )
-        pages_with_questions.extend(batch_results)
+        
+        # Send OCR text as plain text prompt
+        prompt = f"{MCQ_CREATE_QUIZ_PROMPT}\n\nPage {page_num} content:\n\n{page_text}"
+        
+        try:
+            resp = model.generate_content(prompt)
+            text = getattr(resp, "text", None) or str(resp)
+
+            try:
+                dto = _parse_and_normalize_create_quiz_dto(text)
+            except ValueError:
+                # Retry with repair prompt
+                repair_prompt = f"{REPAIR_TO_JSON_PROMPT_TEMPLATE}\n\n{text}\n"
+                resp2 = model.generate_content(repair_prompt)
+                text2 = getattr(resp2, "text", None) or str(resp2)
+                dto = _parse_and_normalize_create_quiz_dto(text2)
+
+            # Extract questions and associate with page number
+            questions = dto.get("questions", [])
+            if isinstance(questions, list) and questions:
+                pages_with_questions.append({
+                    "pageNumber": page_num,
+                    "questions": questions,
+                    "questionCount": len(questions),
+                })
+            else:
+                # No questions found on this page
+                pages_with_questions.append({
+                    "pageNumber": page_num,
+                    "questions": [],
+                    "questionCount": 0,
+                })
+        except Exception as e:
+            # Log error but continue
+            pages_with_questions.append({
+                "pageNumber": page_num,
+                "questions": [],
+                "questionCount": 0,
+                "error": str(e)[:200],
+            })
 
     if progress_callback:
-        progress_callback(f"Completed: {len(filtered_page_pdfs)} pages processed", 1.0)
+        progress_callback(f"Completed: {len(ocr_texts)} pages processed", 1.0)
 
     # Build final result
     title = f"Quiz from {filename}"
@@ -268,9 +230,9 @@ def process_filtered_pages_with_ai(
 
     result = {
         "title": title,
-        "description": f"Extracted from {len(filtered_page_pdfs)} pages with questions",
+        "description": f"Extracted from {len(ocr_texts)} pages",
         "pages": pages_with_questions,
-        "filteredPages": len(filtered_page_pdfs),
+        "totalPages": len(ocr_texts),
     }
 
     return result
@@ -363,28 +325,36 @@ def extract_create_quiz_dto_from_pdf_bytes(
     cfg: GeminiConfig,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
-    """Split PDF into chunks, process in batches, and merge results."""
+    """Extract text via OCR, process in chunks, and merge results into a flat question list."""
 
     if not cfg.api_key:
         raise ValueError("Missing GEMINI_API_KEY")
 
     # Validate page count
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    total_pages = len(reader.pages)
+    total_pages = get_page_count(pdf_bytes)
     if total_pages > cfg.max_pages:
         raise ValueError(f"PDF has {total_pages} pages (max allowed: {cfg.max_pages})")
 
     if progress_callback:
-        progress_callback(f"Splitting {total_pages} pages into chunks...", 0.05)
+        progress_callback(f"Starting OCR extraction on {total_pages} pages...", 0.0)
 
-    # Split into chunks of pages_per_chunk
-    chunk_pdfs = split_pdf_into_chunks(pdf_bytes, pages_per_chunk=cfg.pages_per_chunk)
-    if not chunk_pdfs:
-        raise ValueError("Failed to split PDF into chunks")
+    # STEP 1: Extract OCR text from all pages
+    page_numbers, ocr_texts = extract_ocr_text_from_all_pages(
+        pdf_bytes,
+        progress_callback=progress_callback
+    )
+    
+    if not ocr_texts:
+        return {
+            "title": f"Quiz from {filename}",
+            "description": f"No pages extracted from {total_pages}-page PDF",
+            "questions": [],
+        }
 
     if progress_callback:
-        progress_callback(f"Created {len(chunk_pdfs)} chunks ({cfg.pages_per_chunk} pages each)", 0.1)
+        progress_callback(f"Processing {len(ocr_texts)} pages with AI...", 0.5)
 
+    # STEP 2: Configure Gemini
     genai.configure(api_key=cfg.api_key)
     generation_config: Dict[str, Any] = {
         "temperature": float(cfg.temperature),
@@ -393,27 +363,74 @@ def extract_create_quiz_dto_from_pdf_bytes(
     }
     model = genai.GenerativeModel(model_name=cfg.model_name, generation_config=generation_config)
 
-    # Process chunks in batches (Gemini file upload limit is 10)
+    # STEP 3: Process pages in chunks with rate limiting (5 RPM)
+    rpm_limit = 5
+    seconds_per_request = 60.0 / rpm_limit
+    
     all_questions: List[Dict[str, Any]] = []
-    batch_size = 10
-    num_batches = (len(chunk_pdfs) + batch_size - 1) // batch_size
+    last_request_time = 0.0
+    
+    # Group pages into chunks
+    chunk_size = cfg.pages_per_chunk
+    num_chunks = (len(ocr_texts) + chunk_size - 1) // chunk_size
 
-    for batch_idx in range(num_batches):
-        batch_start = batch_idx * batch_size
-        batch_end = min(batch_start + batch_size, len(chunk_pdfs))
-        batch_chunks = chunk_pdfs[batch_start:batch_end]
+    for chunk_idx in range(num_chunks):
+        # Rate limiting
+        if chunk_idx > 0:
+            elapsed = time.time() - last_request_time
+            if elapsed < seconds_per_request:
+                wait_time = seconds_per_request - elapsed
+                if progress_callback:
+                    progress_callback(
+                        f"Rate limiting: waiting {wait_time:.1f}s (5 RPM limit)...",
+                        0.5 + (0.4 * (chunk_idx / num_chunks)),
+                    )
+                time.sleep(wait_time)
+
+        chunk_start = chunk_idx * chunk_size
+        chunk_end = min(chunk_start + chunk_size, len(ocr_texts))
+        chunk_texts = ocr_texts[chunk_start:chunk_end]
+        chunk_page_nums = page_numbers[chunk_start:chunk_end]
 
         if progress_callback:
             progress_callback(
-                f"Processing batch {batch_idx + 1}/{num_batches} (chunks {batch_start + 1}-{batch_end})...",
-                0.1 + (0.8 * (batch_idx / num_batches)),
+                f"AI processing chunk {chunk_idx + 1}/{num_chunks} (pages {chunk_start + 1}-{chunk_end})...",
+                0.5 + (0.4 * (chunk_idx / num_chunks)),
             )
 
-        batch_questions = _process_chunk_batch(batch_chunks, model, filename, batch_start)
-        all_questions.extend(batch_questions)
+        last_request_time = time.time()
+        
+        # Combine chunk texts into one prompt
+        combined_text = "\n\n".join([
+            f"Page {page_num}:\n{text}" 
+            for page_num, text in zip(chunk_page_nums, chunk_texts)
+        ])
+        
+        prompt = f"{MCQ_CREATE_QUIZ_PROMPT}\n\nContent:\n\n{combined_text}"
+        
+        try:
+            resp = model.generate_content(prompt)
+            text = getattr(resp, "text", None) or str(resp)
+
+            try:
+                dto = _parse_and_normalize_create_quiz_dto(text)
+            except ValueError:
+                # Retry with repair prompt
+                repair_prompt = f"{REPAIR_TO_JSON_PROMPT_TEMPLATE}\n\n{text}\n"
+                resp2 = model.generate_content(repair_prompt)
+                text2 = getattr(resp2, "text", None) or str(resp2)
+                dto = _parse_and_normalize_create_quiz_dto(text2)
+
+            # Extract questions and merge into flat list
+            questions = dto.get("questions", [])
+            if isinstance(questions, list):
+                all_questions.extend(questions)
+        except Exception as e:
+            # Log error but continue
+            print(f"[ERROR] Chunk {chunk_idx + 1} failed: {str(e)[:200]}")
 
     if progress_callback:
-        progress_callback(f"Merging {len(all_questions)} questions...", 0.95)
+        progress_callback(f"Completed: {len(all_questions)} questions extracted", 1.0)
 
     # Build final CreateQuizDto
     title = f"Quiz from {filename}"
@@ -436,12 +453,11 @@ def extract_create_quiz_dto_by_page(
     cfg: GeminiConfig,
     progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
-    """Extract questions page-by-page with OCR pre-filtering and rate limiting.
+    """Extract questions page-by-page using OCR text extraction.
     
     Workflow:
-    1. OCR all pages to detect questions/answer keys (fast, cheap)
-    2. Filter to only relevant pages
-    3. Process filtered pages with Gemini AI (slow, expensive)
+    1. OCR all pages to extract text
+    2. Process pages with Gemini AI using text prompts (15 RPM, cheap)
     
     Args:
         pdf_bytes: Original PDF bytes
@@ -461,247 +477,36 @@ def extract_create_quiz_dto_by_page(
         raise ValueError(f"PDF has {total_pages} pages (max allowed: {cfg.max_pages})")
 
     if progress_callback:
-        progress_callback(f"Starting OCR pre-filtering on {total_pages} pages...", 0.0)
+        progress_callback(f"Starting OCR extraction on {total_pages} pages...", 0.0)
 
-    # STEP 1: OCR filter to find pages with questions (0.0 - 0.3 progress)
-    filtered_page_numbers, filtered_page_pdfs = filter_pages_with_questions(
+    # STEP 1: OCR extract text from all pages
+    page_numbers, ocr_texts = extract_ocr_text_from_all_pages(
         pdf_bytes,
         progress_callback=progress_callback
     )
     
-    if not filtered_page_pdfs:
-        # No pages with questions found
+    if not ocr_texts:
+        # No pages extracted
         if progress_callback:
-            progress_callback("No pages with questions detected", 1.0)
+            progress_callback("No pages extracted", 1.0)
         return {
             "title": f"Quiz from {filename}",
-            "description": f"No questions found in {total_pages}-page PDF",
+            "description": f"No pages extracted from {total_pages}-page PDF",
             "pages": [],
             "totalPages": total_pages,
-            "filteredPages": 0,
         }
     
-    if progress_callback:
-        progress_callback(
-            f"Processing {len(filtered_page_pdfs)} pages with AI (filtered from {total_pages})...",
-            0.35
-        )
-
-    # STEP 2: Process filtered pages with Gemini AI (0.35 - 0.95 progress)
-    genai.configure(api_key=cfg.api_key)
-    generation_config: Dict[str, Any] = {
-        "temperature": float(cfg.temperature),
-        "max_output_tokens": int(cfg.max_output_tokens),
-        "response_mime_type": "application/json",
-    }
-    model = genai.GenerativeModel(model_name=cfg.model_name, generation_config=generation_config)
-
-    # Process pages in batches of 10 (Gemini upload limit) with rate limiting (5 RPM)
-    batch_size = 10
-    rpm_limit = 5
-    seconds_per_request = 60.0 / rpm_limit  # 12 seconds between requests for 5 RPM
+    # STEP 2: Process all pages with Gemini AI using text prompts
+    result = process_pages_with_ai(
+        ocr_texts,
+        page_numbers,
+        filename,
+        cfg,
+        progress_callback
+    )
     
-    num_batches = (len(filtered_page_pdfs) + batch_size - 1) // batch_size
-    pages_with_questions: List[Dict[str, Any]] = []
-    last_request_time = 0.0
-
-    for batch_idx in range(num_batches):
-        # Rate limiting: ensure we don't exceed 5 RPM
-        if batch_idx > 0:
-            elapsed = time.time() - last_request_time
-            if elapsed < seconds_per_request:
-                wait_time = seconds_per_request - elapsed
-                if progress_callback:
-                    progress_callback(
-                        f"Rate limiting: waiting {wait_time:.1f}s (5 RPM limit)...",
-                        0.35 + (0.6 * (batch_idx / num_batches)),
-                    )
-                time.sleep(wait_time)
-        
-        batch_start = batch_idx * batch_size
-        batch_end = min(batch_start + batch_size, len(filtered_page_pdfs))
-        batch_pages = filtered_page_pdfs[batch_start:batch_end]
-        batch_page_numbers = filtered_page_numbers[batch_start:batch_end]
-
-        if progress_callback:
-            progress_callback(
-                f"AI processing filtered pages {batch_start + 1}-{batch_end}/{len(filtered_page_pdfs)}...",
-                0.35 + (0.6 * (batch_idx / num_batches)),
-            )
-
-        last_request_time = time.time()
-        batch_results = _process_pages_batch_with_page_numbers(
-            batch_pages, 
-            batch_page_numbers,
-            model, 
-            filename
-        )
-        pages_with_questions.extend(batch_results)
-
-    if progress_callback:
-        progress_callback(f"Completed: {len(filtered_page_pdfs)} pages processed", 0.95)
-
-    # Build final result with page-grouped questions
-    title = f"Quiz from {filename}"
-    if len(title) > 200:
-        title = title[:197] + "..."
-
-    result = {
-        "title": title,
-        "description": f"Extracted from {total_pages}-page PDF ({len(filtered_page_pdfs)} pages with questions)",
-        "pages": pages_with_questions,  # Array of {pageNumber, questions[]}
-        "totalPages": total_pages,
-        "filteredPages": len(filtered_page_pdfs),
-    }
-
+    result["totalPages"] = total_pages
     return result
-
-
-def _process_pages_batch(
-    page_pdfs: List[bytes],
-    model: Any,
-    base_filename: str,
-    batch_offset: int,
-) -> List[Dict[str, Any]]:
-    """Process a batch of single-page PDFs and return questions with page numbers.
-    
-    Args:
-        page_pdfs: List of single-page PDF bytes
-        model: Gemini model instance
-        base_filename: Original filename
-        batch_offset: Starting page index for this batch
-        
-    Returns:
-        List of dicts with pageNumber and questions array
-    """
-    page_numbers = [batch_offset + i + 1 for i in range(len(page_pdfs))]
-    return _process_pages_batch_with_page_numbers(page_pdfs, page_numbers, model, base_filename)
-
-
-def _process_pages_batch_with_page_numbers(
-    page_pdfs: List[bytes],
-    page_numbers: List[int],
-    model: Any,
-    base_filename: str,
-) -> List[Dict[str, Any]]:
-    """Process a batch of single-page PDFs with explicit page numbers.
-    
-    Args:
-        page_pdfs: List of single-page PDF bytes
-        page_numbers: Corresponding page numbers for each PDF
-        model: Gemini model instance
-        base_filename: Original filename
-        
-    Returns:
-        List of dicts with pageNumber and questions array
-    """
-    uploaded_files = []
-    tmp_paths: List[str] = []
-    results: List[Dict[str, Any]] = []
-
-    try:
-        # Upload all pages in this batch
-        for i, page_bytes in enumerate(page_pdfs):
-            page_num = page_numbers[i]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(page_bytes)
-                tmp.flush()
-                tmp_paths.append(tmp.name)
-                uploaded = genai.upload_file(
-                    path=tmp.name, 
-                    display_name=f"{base_filename}_page{page_num}"
-                )
-                uploaded_files.append((uploaded, page_num))
-
-        # Process each page individually to maintain page-to-questions mapping
-        for uploaded_file, page_num in uploaded_files:
-            prompt_parts = [uploaded_file, MCQ_CREATE_QUIZ_PROMPT]
-            resp = model.generate_content(prompt_parts)
-            text = getattr(resp, "text", None) or str(resp)
-
-            try:
-                dto = _parse_and_normalize_create_quiz_dto(text)
-            except ValueError:
-                # Retry with repair prompt
-                repair_prompt = f"{REPAIR_TO_JSON_PROMPT_TEMPLATE}\n\n{text}\n"
-                resp2 = model.generate_content([repair_prompt])
-                text2 = getattr(resp2, "text", None) or str(resp2)
-                dto = _parse_and_normalize_create_quiz_dto(text2)
-
-            # Extract questions and associate with page number
-            questions = dto.get("questions", [])
-            if isinstance(questions, list) and questions:
-                results.append({
-                    "pageNumber": page_num,
-                    "questions": questions,
-                    "questionCount": len(questions),
-                })
-            else:
-                # No questions found on this page
-                results.append({
-                    "pageNumber": page_num,
-                    "questions": [],
-                    "questionCount": 0,
-                })
-
-    finally:
-        # Cleanup temp files
-        for tmp_path in tmp_paths:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-    return results
-
-
-def _process_chunk_batch(
-    chunk_pdfs: List[bytes],
-    model: Any,
-    base_filename: str,
-    batch_offset: int,
-) -> List[Dict[str, Any]]:
-    """Upload chunk PDFs to Gemini, extract questions, return normalized list."""
-    uploaded_files = []
-    tmp_paths: List[str] = []
-
-    try:
-        # Upload all chunks in this batch
-        for i, chunk_bytes in enumerate(chunk_pdfs):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(chunk_bytes)
-                tmp.flush()
-                tmp_paths.append(tmp.name)
-                uploaded = genai.upload_file(path=tmp.name, display_name=f"{base_filename}_chunk{batch_offset + i}")
-                uploaded_files.append(uploaded)
-
-        # Send all uploaded chunks + prompt in one request
-        prompt_parts = uploaded_files + [MCQ_CREATE_QUIZ_PROMPT]
-        resp = model.generate_content(prompt_parts)
-        text = getattr(resp, "text", None) or str(resp)
-
-        try:
-            dto = _parse_and_normalize_create_quiz_dto(text)
-        except ValueError:
-            # Retry with repair prompt
-            repair_prompt = f"{REPAIR_TO_JSON_PROMPT_TEMPLATE}\n\n{text}\n"
-            resp2 = model.generate_content([repair_prompt])
-            text2 = getattr(resp2, "text", None) or str(resp2)
-            dto = _parse_and_normalize_create_quiz_dto(text2)
-
-        # Extract just the questions array
-        questions = dto.get("questions", [])
-        if not isinstance(questions, list):
-            return []
-        return questions
-
-    finally:
-        # Cleanup temp files
-        for tmp_path in tmp_paths:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
 
 
 def _parse_and_normalize_create_quiz_dto(raw: str) -> Dict[str, Any]:

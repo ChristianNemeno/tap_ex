@@ -6,7 +6,7 @@ from datetime import datetime
 import streamlit as st
 from pypdf import PdfReader
 
-from extraction.gemini import GeminiConfig, filter_pages_with_questions
+from extraction.gemini import GeminiConfig, extract_ocr_text_from_all_pages
 from extraction.pdf_utils import get_page_count
 
 
@@ -142,21 +142,21 @@ def scan_document_ocr(uploaded_file):
                 bar_pct = int(10 + (pct * 85))
                 progress_bar.progress(min(bar_pct, 95))
 
-            # Run OCR filtering
-            filtered_page_numbers, filtered_page_pdfs = filter_pages_with_questions(
+            # Run OCR extraction on all pages
+            filtered_page_numbers, filtered_ocr_texts = extract_ocr_text_from_all_pages(
                 pdf_bytes=pdf_bytes,
                 progress_callback=update_progress,
             )
 
             # Store in session state
-            st.session_state.filtered_pages = filtered_page_pdfs
+            st.session_state.filtered_pages = filtered_ocr_texts
             st.session_state.filtered_page_numbers = filtered_page_numbers
             st.session_state.ocr_filtering_complete = True
 
             progress_bar.progress(100)
-            status_text.text(f"✅ Found {len(filtered_page_pdfs)} pages with questions!")
+            status_text.text(f"✅ Extracted text from {len(filtered_ocr_texts)} pages!")
             
-            st.success(f"OCR scan complete! Found **{len(filtered_page_pdfs)}** pages with questions out of **{total_pages}** total pages.")
+            st.success(f"OCR extraction complete! Extracted text from **{len(filtered_ocr_texts)}** pages out of **{total_pages}** total pages.")
             st.balloons()
 
         except Exception as e:

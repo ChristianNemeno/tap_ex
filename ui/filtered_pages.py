@@ -2,6 +2,23 @@
 
 import streamlit as st
 from io import BytesIO
+import base64
+import os
+from pdf2image import convert_from_bytes
+
+# Configure poppler path for Windows
+POPPLER_PATH = None
+if os.name == 'nt':  # Windows
+    possible_paths = [
+        r'C:\poppler\Release-25.12.0-0\poppler-25.12.0\Library\bin',
+        r'C:\Program Files\poppler\Library\bin',
+        r'C:\poppler\Library\bin',
+        r"C:\poppler\Release-25.12.0-0\poppler-25.12.0\Library\bin"
+    ]
+    for path in possible_paths:
+        if os.path.exists(path):
+            POPPLER_PATH = path
+            break
 
 
 def render_filtered_pages_section():
@@ -62,28 +79,51 @@ def render_filtered_pages_section():
                 with st.container(border=True):
                     st.markdown(f"**Page {page_num}**")
                     
-                    # Show PDF preview (note: st doesn't have native PDF preview, so show info)
+                    # Show PDF preview as image
+                    try:
+                        images = convert_from_bytes(
+                            page_pdf, 
+                            dpi=150, 
+                            first_page=1, 
+                            last_page=1,
+                            poppler_path=POPPLER_PATH
+                        )
+                        if images:
+                            st.image(images[0], use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Preview unavailable")
+                        st.caption(f"Error: {str(e)[:100]}")
+                        if "poppler" in str(e).lower():
+                            st.caption("⚠️ Poppler not found. Add to PATH or check installation.")
+                    
                     st.caption(f"Size: {len(page_pdf) / 1024:.1f} KB")
                     
-                    # Download button for this page
-                    st.download_button(
-                        label="📥 Download",
-                        data=page_pdf,
-                        file_name=f"page_{page_num}.pdf",
-                        mime="application/pdf",
-                        key=f"download_page_{page_num}",
-                        use_container_width=True,
-                    )
+                    # Action buttons in columns
+                    btn_col1, btn_col2 = st.columns(2)
                     
-                    # Remove button
-                    if st.button(
-                        "🗑️ Remove",
-                        key=f"remove_page_{page_num}",
-                        use_container_width=True,
-                        type="secondary"
-                    ):
-                        remove_page(page_idx)
-                        st.rerun()
+                    with btn_col1:
+                        # Download button for this page
+                        st.download_button(
+                            label="📥",
+                            data=page_pdf,
+                            file_name=f"page_{page_num}.pdf",
+                            mime="application/pdf",
+                            key=f"download_page_{page_num}",
+                            use_container_width=True,
+                            help="Download this page"
+                        )
+                    
+                    with btn_col2:
+                        # Remove button
+                        if st.button(
+                            "🗑️",
+                            key=f"remove_page_{page_num}",
+                            use_container_width=True,
+                            type="secondary",
+                            help="Remove this page"
+                        ):
+                            remove_page(page_idx)
+                            st.rerun()
     
     st.markdown("---")
     

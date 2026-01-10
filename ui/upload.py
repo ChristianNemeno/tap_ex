@@ -129,6 +129,9 @@ def scan_document_ocr(uploaded_file):
             progress_bar.progress(5)
             pdf_bytes = uploaded_file.getvalue()
             
+            # Store PDF bytes in session state for later AI processing
+            st.session_state.uploaded_pdf_bytes = pdf_bytes
+            
             # Get total page count
             total_pages = get_page_count(pdf_bytes)
             st.session_state.total_pages = total_pages

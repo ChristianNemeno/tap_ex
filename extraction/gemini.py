@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Callable, Tuple
 import io
 
 import google.generativeai as genai
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 from pdf2image import convert_from_bytes
 import pytesseract
 
@@ -113,6 +113,7 @@ def process_pages_with_ai(
     filename: str,
     cfg: GeminiConfig,
     progress_callback: Optional[Callable[[str, float], None]] = None,
+    pdf_bytes: Optional[bytes] = None,
 ) -> Dict[str, Any]:
     """Process OCR text from pages with Gemini AI.
     
@@ -122,6 +123,7 @@ def process_pages_with_ai(
         filename: Original PDF filename
         cfg: Gemini configuration
         progress_callback: Optional callback for progress updates
+        pdf_bytes: Optional original PDF bytes to send with OCR text for better context
         
     Returns:
         Dictionary with title, description, and pages array containing questions per page
@@ -143,6 +145,43 @@ def process_pages_with_ai(
             0.0
         )
 
+    # Prepare a PDF reader if we want to attach PDF chunks to the prompt.
+    # We will build each chunk PDF from the exact selected pages (works even if user removed pages).
+    pdf_reader: Optional[PdfReader] = None
+    if pdf_bytes:
+        try:
+            pdf_reader = PdfReader(io.BytesIO(pdf_bytes))
+        except Exception as e:
+            print(f"[WARNING] Could not read PDF bytes for AI attachment: {str(e)}")
+            pdf_reader = None
+
+    def _build_pdf_bytes_for_page_numbers(page_nums_1_based: List[int]) -> Optional[bytes]:
+        if pdf_reader is None:
+            return None
+
+        try:
+            writer = PdfWriter()
+            for page_num in page_nums_1_based:
+                page_idx = int(page_num) - 1
+                if page_idx < 0 or page_idx >= len(pdf_reader.pages):
+                    continue
+                writer.add_page(pdf_reader.pages[page_idx])
+
+            buf = io.BytesIO()
+            writer.write(buf)
+            return buf.getvalue()
+        except Exception as e:
+            print(f"[WARNING] Could not build PDF bytes for chunk pages {page_nums_1_based[:3]}...: {str(e)}")
+            return None
+
+    def _pdf_part(pdf_data: bytes) -> Any:
+        """Create a Gemini content part for a PDF, using the best available SDK API."""
+        try:
+            part = genai.types.Part.from_bytes(data=pdf_data, mime_type="application/pdf")
+            return part
+        except Exception:
+            return {"mime_type": "application/pdf", "data": pdf_data}
+
     # Configure Gemini
     genai.configure(api_key=cfg.api_key)
     generation_config: Dict[str, Any] = {
@@ -152,39 +191,78 @@ def process_pages_with_ai(
     }
     model = genai.GenerativeModel(model_name=cfg.model_name, generation_config=generation_config)
 
-    # Process pages with rate limiting (5 RPM for free tier)
+    # Process pages in chunks with rate limiting (5 RPM for free tier)
     rpm_limit = 5
     seconds_per_request = 60.0 / rpm_limit  # 12 seconds between requests
     
     pages_with_questions: List[Dict[str, Any]] = []
     last_request_time = 0.0
+    
+    # Group pages and OCR texts into chunks
+    chunk_size = cfg.pages_per_chunk
+    num_chunks = (len(ocr_texts) + chunk_size - 1) // chunk_size
 
-    for idx, (page_text, page_num) in enumerate(zip(ocr_texts, page_numbers)):
+    for chunk_idx in range(num_chunks):
         # Rate limiting
-        if idx > 0:
+        if chunk_idx > 0:
             elapsed = time.time() - last_request_time
             if elapsed < seconds_per_request:
                 wait_time = seconds_per_request - elapsed
                 if progress_callback:
                     progress_callback(
                         f"Rate limiting: waiting {wait_time:.1f}s (5 RPM limit)...",
-                        idx / len(ocr_texts),
+                        chunk_idx / num_chunks,
                     )
                 time.sleep(wait_time)
+        
+        # Get chunk data
+        chunk_start = chunk_idx * chunk_size
+        chunk_end = min(chunk_start + chunk_size, len(ocr_texts))
+        chunk_texts = ocr_texts[chunk_start:chunk_end]
+        chunk_page_nums = page_numbers[chunk_start:chunk_end]
 
         if progress_callback:
             progress_callback(
-                f"AI processing page {page_num} ({idx + 1}/{len(ocr_texts)})...",
-                idx / len(ocr_texts),
+                f"AI processing chunk {chunk_idx + 1}/{num_chunks} (pages {chunk_page_nums[0]}-{chunk_page_nums[-1]})...",
+                chunk_idx / num_chunks,
             )
 
         last_request_time = time.time()
         
-        # Send OCR text as plain text prompt
-        prompt = f"{MCQ_CREATE_QUIZ_PROMPT}\n\nPage {page_num} content:\n\n{page_text}"
+        # Prepare content parts: PDF chunk (if available) + combined OCR text
+        content_parts = []
+        
+        # Add PDF chunk if available (built from the exact page numbers in this chunk)
+        chunk_pdf_bytes = _build_pdf_bytes_for_page_numbers(chunk_page_nums)
+        if chunk_pdf_bytes:
+            content_parts.append(_pdf_part(chunk_pdf_bytes))
+            print(
+                f"[DEBUG] Added PDF chunk {chunk_idx + 1} to content ({len(chunk_pdf_bytes)} bytes, pages {chunk_page_nums[0]}-{chunk_page_nums[-1]})"
+            )
+        
+        # Combine OCR texts for this chunk
+        combined_text = "\n\n".join([
+            f"Page {page_num}:\n{text}" 
+            for page_num, text in zip(chunk_page_nums, chunk_texts)
+        ])
+        
+        # Add prompt with combined OCR text
+        prompt_text = (
+            f"{MCQ_CREATE_QUIZ_PROMPT}\n\n"
+            f"Pages in this chunk: {chunk_page_nums[0]}-{chunk_page_nums[-1]}\n\n"
+            f"OCR-extracted text (for reference, segmented by page):\n\n{combined_text}"
+        )
+        content_parts.append(prompt_text)
         
         try:
-            resp = model.generate_content(prompt)
+            # Send multipart content (PDF + OCR text) or just text if no PDF
+            if len(content_parts) > 1:
+                resp = model.generate_content(content_parts)
+                print(f"[DEBUG] Sent chunk {chunk_idx + 1} with both PDF and OCR text")
+            else:
+                resp = model.generate_content(prompt_text)
+                print(f"[DEBUG] Sent chunk {chunk_idx + 1} with OCR text only")
+            
             text = getattr(resp, "text", None) or str(resp)
 
             try:
@@ -194,34 +272,54 @@ def process_pages_with_ai(
                 repair_prompt = f"{REPAIR_TO_JSON_PROMPT_TEMPLATE}\n\n{text}\n"
                 resp2 = model.generate_content(repair_prompt)
                 text2 = getattr(resp2, "text", None) or str(resp2)
-                dto = _parse_and_normalize_create_quiz_dto(text2)
 
-            # Extract questions and associate with page number
+                try:
+                    dto = _parse_and_normalize_create_quiz_dto(text2)
+                except ValueError:
+                    # Final retry: constrain output size (helps when responses are truncated or schema drifts).
+                    constrained_prompt = (
+                        f"{MCQ_CREATE_QUIZ_PROMPT}\n\n"
+                        f"Pages in this chunk: {chunk_page_nums[0]}-{chunk_page_nums[-1]}\n"
+                        "IMPORTANT: Return at most 15 questions total for this chunk. "
+                        "Prefer the clearest MCQs. Output MUST be one valid JSON object.\n\n"
+                        f"OCR-extracted text (for reference, segmented by page):\n\n{combined_text}"
+                    )
+
+                    retry_parts: List[Any] = [constrained_prompt]
+                    if chunk_pdf_bytes:
+                        retry_parts = [_pdf_part(chunk_pdf_bytes), constrained_prompt]
+
+                    resp3 = model.generate_content(retry_parts)
+                    text3 = getattr(resp3, "text", None) or str(resp3)
+                    dto = _parse_and_normalize_create_quiz_dto(text3)
+
+            # Extract questions from chunk - we don't have per-page info, so group them together
             questions = dto.get("questions", [])
             if isinstance(questions, list) and questions:
+                # Associate questions with the chunk's page range
                 pages_with_questions.append({
-                    "pageNumber": page_num,
+                    "pageNumber": f"{chunk_page_nums[0]}-{chunk_page_nums[-1]}" if len(chunk_page_nums) > 1 else chunk_page_nums[0],
                     "questions": questions,
                     "questionCount": len(questions),
                 })
             else:
-                # No questions found on this page
+                # No questions found in this chunk
                 pages_with_questions.append({
-                    "pageNumber": page_num,
+                    "pageNumber": f"{chunk_page_nums[0]}-{chunk_page_nums[-1]}" if len(chunk_page_nums) > 1 else chunk_page_nums[0],
                     "questions": [],
                     "questionCount": 0,
                 })
         except Exception as e:
             # Log error but continue
             pages_with_questions.append({
-                "pageNumber": page_num,
+                "pageNumber": f"{chunk_page_nums[0]}-{chunk_page_nums[-1]}" if len(chunk_page_nums) > 1 else chunk_page_nums[0],
                 "questions": [],
                 "questionCount": 0,
                 "error": str(e)[:200],
             })
 
     if progress_callback:
-        progress_callback(f"Completed: {len(ocr_texts)} pages processed", 1.0)
+        progress_callback(f"Completed: {len(ocr_texts)} pages processed in {num_chunks} chunks", 1.0)
 
     # Build final result
     title = f"Quiz from {filename}"
@@ -230,7 +328,7 @@ def process_pages_with_ai(
 
     result = {
         "title": title,
-        "description": f"Extracted from {len(ocr_texts)} pages",
+        "description": f"Extracted from {len(ocr_texts)} pages ({num_chunks} chunks)",
         "pages": pages_with_questions,
         "totalPages": len(ocr_texts),
     }
@@ -241,8 +339,13 @@ def process_pages_with_ai(
 MCQ_CREATE_QUIZ_PROMPT = """
 You are an expert at extracting multiple-choice quizzes from PDFs.
 
+Note: You are receiving BOTH the original PDF chunk AND OCR-extracted text for better context.
+The PDF shows the actual document layout, images, and formatting.
+The OCR text provides a text extraction that may help with difficult-to-read text.
+Use both sources together to extract questions accurately.
+
 Task:
-Extract the quiz content from the attached PDF and output a single JSON object matching this exact shape (CreateQuizDto):
+Extract the quiz content from the provided materials and output a single JSON object matching this exact shape (CreateQuizDto):
 
 {
     "title": "...",
@@ -561,6 +664,9 @@ def _parse_and_normalize_create_quiz_dto(raw: str) -> Dict[str, Any]:
             image_url = None
 
         choices = q.get("choices")
+        if choices is None:
+            # Common schema drift from models.
+            choices = q.get("options")
         if not isinstance(choices, list):
             continue
         choices_norm = _normalize_choices(choices)
@@ -591,6 +697,14 @@ def _parse_and_normalize_create_quiz_dto(raw: str) -> Dict[str, Any]:
 def _normalize_choices(choices: List[Any]) -> Optional[List[Dict[str, Any]]]:
     raw_items: List[Dict[str, Any]] = []
     for c in choices:
+        # Accept either {text,isCorrect} objects or plain strings.
+        if isinstance(c, str):
+            text = _clamp_text(c.strip(), min_len=1, max_len=500)
+            if not text:
+                continue
+            raw_items.append({"text": text, "isCorrect": False})
+            continue
+
         if not isinstance(c, dict):
             continue
         text = c.get("text")

@@ -192,12 +192,16 @@ def process_with_ai():
                 status_text.text(msg)
                 progress_bar.progress(min(int(pct * 100), 100))
             
+            # Get original PDF bytes from session state
+            pdf_bytes = st.session_state.get('uploaded_pdf_bytes', None)
+            
             results = process_pages_with_ai(
                 ocr_texts=st.session_state.filtered_pages,
                 page_numbers=st.session_state.filtered_page_numbers,
                 filename=st.session_state.uploaded_file_name or "document.pdf",
                 cfg=cfg,
                 progress_callback=update_progress,
+                pdf_bytes=pdf_bytes,
             )
             
             # Store results

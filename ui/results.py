@@ -78,7 +78,11 @@ def render_results_section():
             
             with st.expander(f"Page {page_num} ({question_count} question{'s' if question_count != 1 else ''})", expanded=question_count > 0):
                 if question_count == 0:
-                    st.info("No questions found on this page")
+                    err = page_data.get('error')
+                    if err:
+                        st.error(f"AI/parse error for this chunk: {err}")
+                    else:
+                        st.info("No questions found on this page")
                 else:
                     for idx, question in enumerate(questions, 1):
                         st.markdown(f"**Q{idx}: {question.get('text', 'N/A')}**")
